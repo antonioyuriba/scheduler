@@ -44,6 +44,9 @@ class ScheduleMessage(BaseModel):
     payload: Dict[str, Any]
     webhookUrl: str
 
+# Dicionário para controlar jobs agendados por ID
+scheduled_jobs = {}
+
 def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any]):
     try:
         response = requests.post(webhook_url, json=payload, timeout=30)
@@ -54,8 +57,17 @@ def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any]):
     finally:
         redis_client.delete(f"message:{message_id}")
         print(f"Message {message_id} cleaned from Redis")
+        # Remove job do dicionário após execução
+        if message_id in scheduled_jobs:
+            scheduled_jobs.pop(message_id, None)
+            schedule.clear(message_id)
 
 def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str, payload: Dict[str, Any]):
+    # Cancela job agendado anterior se existir
+    if message_id in scheduled_jobs:
+        schedule.clear(message_id)
+        scheduled_jobs.pop(message_id)
+
     schedule_time = datetime.fromisoformat(schedule_timestamp.replace('Z', '+00:00'))
     current_time = datetime.now(schedule_time.tzinfo)
     
@@ -67,7 +79,8 @@ def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str,
         fire_webhook(message_id, webhook_url, payload)
         return schedule.CancelJob
     
-    schedule.every().day.at(schedule_time.strftime("%H:%M")).do(job).tag(message_id)
+    job_instance = schedule.every().day.at(schedule_time.strftime("%H:%M")).do(job).tag(message_id)
+    scheduled_jobs[message_id] = job_instance
 
 def scheduler_worker():
     while True:
@@ -110,9 +123,10 @@ async def create_scheduled_message(message: ScheduleMessage, token: str = Depend
         redis_key = f"message:{message.id}"
         
         if redis_client.exists(redis_key):
-            print(f"[{datetime.now().isoformat()}] Message already exists in Redis - ID: {message.id}")
-            raise HTTPException(status_code=409, detail="Message with this ID already exists")
-        
+            print(f"[{datetime.now().isoformat()}] Message exists, updating - ID: {message.id}")
+        else:
+            print(f"[{datetime.now().isoformat()}] Creating new message - ID: {message.id}")
+
         message_data = {
             "id": message.id,
             "scheduleTo": message.scheduleTo,
@@ -121,17 +135,14 @@ async def create_scheduled_message(message: ScheduleMessage, token: str = Depend
         }
         
         redis_client.set(redis_key, json.dumps(message_data))
-        print(f"[{datetime.now().isoformat()}] Message inserted to Redis - ID: {message.id}")
+        print(f"[{datetime.now().isoformat()}] Message stored in Redis - ID: {message.id}")
         
         schedule_message(message.id, message.scheduleTo, message.webhookUrl, message.payload)
         
         return {"status": "scheduled", "messageId": message.id}
     
-    except HTTPException as http_exc:
-        print(f"[{datetime.now().isoformat()}] HTTPException in create: {http_exc.status_code} - {http_exc.detail}")
-        raise
     except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Unexpected exception in create: {type(e).__name__}: {str(e)}")
+        print(f"[{datetime.now().isoformat()}] Error in create: {type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to schedule message: {str(e)}")
 
 @app.delete("/messages/{message_id}")
@@ -146,14 +157,13 @@ async def delete_scheduled_message(message_id: str, token: str = Depends(verify_
         redis_client.delete(redis_key)
         
         schedule.clear(message_id)
+        if message_id in scheduled_jobs:
+            scheduled_jobs.pop(message_id)
         
         return {"status": "deleted", "messageId": message_id}
     
-    except HTTPException as http_exc:
-        print(f"[{datetime.now().isoformat()}] HTTPException in delete: {http_exc.status_code} - {http_exc.detail}")
-        raise
     except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Unexpected exception in delete: {type(e).__name__}: {str(e)}")
+        print(f"[{datetime.now().isoformat()}] Error in delete: {type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to delete message: {str(e)}")
 
 @app.get("/messages")
