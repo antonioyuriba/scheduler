@@ -1,6 +1,9 @@
 # Use Python 3.11 slim image
 FROM python:3.11-slim
 
+# Instala dependências básicas
+RUN apt-get update && apt-get install -y gcc
+
 # Set working directory
 WORKDIR /app
 
