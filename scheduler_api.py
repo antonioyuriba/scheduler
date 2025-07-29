@@ -150,21 +150,21 @@ async def delete_scheduled_message(message_id: str, token: str = Depends(verify_
     try:
         redis_key = f"message:{message_id}"
         
-        if not redis_client.exists(redis_key):
-            print(f"[{datetime.now().isoformat()}] Message not found in Redis - ID: {message_id}")
-            raise HTTPException(status_code=404, detail="Message not found")
+        redis_client.delete(redis_key)  # Tenta deletar, mesmo se não existir
         
-        redis_client.delete(redis_key)
+        try:
+            schedule.clear(message_id)
+        except ValueError:
+            print(f"[{datetime.now().isoformat()}] No schedule found for ID: {message_id}")
         
-        schedule.clear(message_id)
-        if message_id in scheduled_jobs:
-            scheduled_jobs.pop(message_id)
+        scheduled_jobs.pop(message_id, None)  # Remove do dicionário, se existir
         
         return {"status": "deleted", "messageId": message_id}
     
     except Exception as e:
         print(f"[{datetime.now().isoformat()}] Error in delete: {type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to delete message: {str(e)}")
+
 
 @app.get("/messages")
 async def list_scheduled_messages(token: str = Depends(verify_token)):
