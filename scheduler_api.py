@@ -150,20 +150,43 @@ async def delete_scheduled_message(message_id: str, token: str = Depends(verify_
     try:
         redis_key = f"message:{message_id}"
         
-        redis_client.delete(redis_key)  # Tenta deletar, mesmo se não existir
+        redis_client.delete(redis_key)
         
         try:
             schedule.clear(message_id)
         except ValueError:
             print(f"[{datetime.now().isoformat()}] No schedule found for ID: {message_id}")
         
-        scheduled_jobs.pop(message_id, None)  # Remove do dicionário, se existir
+        scheduled_jobs.pop(message_id, None)
         
         return {"status": "deleted", "messageId": message_id}
     
     except Exception as e:
         print(f"[{datetime.now().isoformat()}] Error in delete: {type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to delete message: {str(e)}")
+
+# NOVO ENDPOINT ADICIONADO AQUI
+@app.get("/messages/{message_id}")
+async def get_scheduled_message(message_id: str, token: str = Depends(verify_token)):
+    """
+    Retrieves the full data of a specific scheduled message from Redis.
+    """
+    try:
+        redis_key = f"message:{message_id}"
+        message_data_json = redis_client.get(redis_key)
+        
+        if not message_data_json:
+            raise HTTPException(status_code=404, detail=f"Message with ID '{message_id}' not found")
+            
+        # Carrega a string JSON para um dicionário Python e a retorna
+        return json.loads(message_data_json)
+        
+    except HTTPException:
+        # Re-lança a exceção HTTP para que o FastAPI a trate corretamente
+        raise
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Error in get_scheduled_message: {type(e).__name__}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve message: {str(e)}")
 
 
 @app.get("/messages")
