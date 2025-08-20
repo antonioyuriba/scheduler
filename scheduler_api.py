@@ -7,7 +7,7 @@ from typing import Dict, Any
 import redis
 import requests
 import schedule
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from pydantic import BaseModel
 import uvicorn
 from dotenv import load_dotenv
@@ -46,6 +46,43 @@ class ScheduleMessage(BaseModel):
 
 # Dicionário para controlar jobs agendados por ID
 scheduled_jobs = {}
+
+def _build_next_run_map():
+    """
+    Retorna um dict {message_id: nextRunIsoStringOrNone} baseado nos jobs do schedule.
+    """
+    next_run_map = {}
+    for job in schedule.jobs:
+        try:
+            tag_id = list(job.tags)[0] if job.tags else None
+            if tag_id:
+                next_run_map[tag_id] = job.next_run.isoformat() if job.next_run else None
+        except Exception:
+            pass
+    return next_run_map
+
+def _iter_message_keys_by_filter(prefix: str | None = None, contains: str | None = None):
+    """
+    Itera sobre chaves message:* no Redis aplicando filtros:
+    - prefix: usa SCAN com MATCH message:{prefix}*
+    - contains: faz SCAN geral e filtra por substring no id
+    """
+    if not prefix and not contains:
+        raise HTTPException(status_code=400, detail="Informe ao menos um filtro: 'prefix' ou 'contains'.")
+
+    if prefix:
+        pattern = f"message:{prefix}*"
+        for key in redis_client.scan_iter(match=pattern, count=1000):
+            yield key
+        return
+
+    for key in redis_client.scan_iter(match="message:*", count=1000):
+        try:
+            msg_id = key.split("message:", 1)[1]
+            if contains in msg_id:
+                yield key
+        except Exception:
+            pass
 
 def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any]):
     try:
@@ -165,7 +202,6 @@ async def delete_scheduled_message(message_id: str, token: str = Depends(verify_
         print(f"[{datetime.now().isoformat()}] Error in delete: {type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to delete message: {str(e)}")
 
-# NOVO ENDPOINT ADICIONADO AQUI
 @app.get("/messages/{message_id}")
 async def get_scheduled_message(message_id: str, token: str = Depends(verify_token)):
     """
@@ -206,6 +242,85 @@ async def list_scheduled_messages(token: str = Depends(verify_token)):
         print(f"[{datetime.now().isoformat()}] Error listing jobs: {type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to list jobs: {str(e)}")
 
+# Novos endpoints: busca e deleção em lote por filtros de ID (prefix/contains)
+@app.get("/messages/search")
+async def search_messages(
+    prefix: str | None = Query(default=None, description="Filtra por prefixo do ID, ex.: {idconta}_{numero}"),
+    contains: str | None = Query(default=None, description="Filtra por substring contida no ID"),
+    token: str = Depends(verify_token),
+):
+    """
+    Lista mensagens salvas no Redis aplicando filtros por ID:
+    - prefix: busca eficiente via SCAN MATCH (message:{prefix}*)
+    - contains: busca geral e filtra no cliente
+    Retorna também o nextRun caso exista job agendado em memória.
+    """
+    try:
+        next_run_map = _build_next_run_map()
+        results = []
+
+        for key in _iter_message_keys_by_filter(prefix=prefix, contains=contains):
+            raw = redis_client.get(key)
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+                msg_id = data.get("id") or key.split("message:", 1)[1]
+                results.append({
+                    "id": msg_id,
+                    "scheduleTo": data.get("scheduleTo"),
+                    "payload": data.get("payload"),
+                    "webhookUrl": data.get("webhookUrl"),
+                    "nextRun": next_run_map.get(msg_id)
+                })
+            except Exception as e:
+                print(f"[{datetime.now().isoformat()}] Failed to parse message {key}: {e}")
+
+        return {"count": len(results), "messages": results}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Error in search_messages: {type(e).__name__}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to search messages: {str(e)}")
+
+@app.delete("/messages/bulk")
+async def bulk_delete_messages(
+    prefix: str | None = Query(default=None, description="Filtra por prefixo do ID, ex.: {idconta}_{numero}"),
+    contains: str | None = Query(default=None, description="Filtra por substring contida no ID"),
+    token: str = Depends(verify_token),
+):
+    """
+    Apaga em lote mensagens que combinem com os filtros de ID e limpa os jobs agendados.
+    """
+    try:
+        if not prefix and not contains:
+            raise HTTPException(status_code=400, detail="Informe ao menos um filtro: 'prefix' ou 'contains'.")
+
+        deleted_ids = []
+        for key in list(_iter_message_keys_by_filter(prefix=prefix, contains=contains)):
+            try:
+                message_id = key.split("message:", 1)[1]
+            except Exception:
+                continue
+
+            redis_client.delete(key)
+
+            try:
+                schedule.clear(message_id)
+            except ValueError:
+                pass
+            except Exception as e:
+                print(f"[{datetime.now().isoformat()}] Failed to clear schedule for {message_id}: {e}")
+
+            scheduled_jobs.pop(message_id, None)
+            deleted_ids.append(message_id)
+
+        return {"deleted": len(deleted_ids), "messageIds": deleted_ids}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Error in bulk_delete_messages: {type(e).__name__}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to bulk delete messages: {str(e)}")
 @app.get("/health")
 async def health_check():
     try:
