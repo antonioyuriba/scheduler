@@ -202,28 +202,6 @@ async def delete_scheduled_message(message_id: str, token: str = Depends(verify_
         print(f"[{datetime.now().isoformat()}] Error in delete: {type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to delete message: {str(e)}")
 
-@app.get("/messages/{message_id}")
-async def get_scheduled_message(message_id: str, token: str = Depends(verify_token)):
-    """
-    Retrieves the full data of a specific scheduled message from Redis.
-    """
-    try:
-        redis_key = f"message:{message_id}"
-        message_data_json = redis_client.get(redis_key)
-        
-        if not message_data_json:
-            raise HTTPException(status_code=404, detail=f"Message with ID '{message_id}' not found")
-            
-        # Carrega a string JSON para um dicionário Python e a retorna
-        return json.loads(message_data_json)
-        
-    except HTTPException:
-        # Re-lança a exceção HTTP para que o FastAPI a trate corretamente
-        raise
-    except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Error in get_scheduled_message: {type(e).__name__}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve message: {str(e)}")
-
 
 @app.get("/messages")
 async def list_scheduled_messages(token: str = Depends(verify_token)):
@@ -282,6 +260,28 @@ async def search_messages(
     except Exception as e:
         print(f"[{datetime.now().isoformat()}] Error in search_messages: {type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to search messages: {str(e)}")
+
+@app.get("/messages/{message_id}")
+async def get_scheduled_message(message_id: str, token: str = Depends(verify_token)):
+    """
+    Retrieves the full data of a specific scheduled message from Redis.
+    """
+    try:
+        redis_key = f"message:{message_id}"
+        message_data_json = redis_client.get(redis_key)
+        
+        if not message_data_json:
+            raise HTTPException(status_code=404, detail=f"Message with ID '{message_id}' not found")
+            
+        # Carrega a string JSON para um dicionário Python e a retorna
+        return json.loads(message_data_json)
+        
+    except HTTPException:
+        # Re-lança a exceção HTTP para que o FastAPI a trate corretamente
+        raise
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Error in get_scheduled_message: {type(e).__name__}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve message: {str(e)}")
 
 @app.delete("/messages/bulk")
 async def bulk_delete_messages(
