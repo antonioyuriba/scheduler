@@ -1,32 +1,33 @@
 # Scheduler API
 
-A webhook scheduling service built by **DinastIA Community** - the largest AI Agents community in Brazil.
+Um serviço de agendamento de webhooks construído com FastAPI, Redis e a biblioteca `schedule`. Desenvolvido pela DinastIA Community.
 
-## Overview
+## Visão Geral
 
-This API allows you to schedule webhook calls for specific timestamps. Messages are stored in Redis and executed only once at the specified time.
+Esta API permite agendar chamadas de webhook para timestamps específicos. As mensagens são persistidas no Redis e executadas exatamente uma vez no horário definido.
 
-### How It Works
+### Como Funciona
 
-1. **Message Scheduling**: When you create a scheduled message, it's stored in Redis and added to the internal scheduler
-2. **One-time Execution**: Jobs are scheduled to run only once at the specified timestamp
-3. **Persistence**: On server restart, all messages from Redis are automatically restored and rescheduled
-4. **Cleanup**: After webhook execution, messages are automatically removed from Redis
+1. Agendamento: ao criar uma mensagem, ela é salva no Redis e adicionada ao scheduler interno.
+2. Execução única: o job executa no horário definido e, após a execução do webhook, a mensagem é removida do Redis e o job é cancelado.
+3. Persistência/Restore: em caso de reinício do servidor, todas as mensagens salvas no Redis são restauradas e re-agendadas automaticamente.
+4. Autenticação: todos os endpoints (exceto `/health`) exigem Bearer Token.
 
-## Prerequisites
+## Pré-requisitos
 
 - Python 3.x
-- Redis server running locally
-- Required dependencies (install with `pip install -r requirements.txt`)
+- Redis em execução (local ou remoto)
+- Dependências Python (instalar com `pip install -r requirements.txt`)
 
-## Environment Setup
+## Setup de Ambiente
 
-Create a `.env` file with:
+Crie um arquivo `.env` com:
 
 ```env
 # Redis Configuration
 REDIS_HOST=localhost
 REDIS_PORT=6379
+REDIS_PASSWORD=
 
 # API Configuration
 API_HOST=0.0.0.0
@@ -34,17 +35,21 @@ API_PORT=8000
 API_TOKEN=your-secret-token-here
 ```
 
-## Running the Server
+Observações:
+- Não faça commit do `.env`. Use o `.env.example` como referência.
+- Em produção, injete as variáveis de ambiente via orquestrador/secret store.
+
+## Executando o Servidor
 
 ```bash
 python scheduler_api.py
 ```
 
-The server will start on `http://localhost:8000`
+O servidor sobe em `http://localhost:8000`.
 
-## Authentication
+## Autenticação
 
-All endpoints (except `/health`) require Bearer token authentication:
+Todos os endpoints (exceto `/health`) exigem Bearer token:
 
 ```
 Authorization: Bearer your-secret-token-here
