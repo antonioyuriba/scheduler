@@ -36,6 +36,10 @@ SWEEP_INTERVAL = int(os.getenv('SWEEP_INTERVAL', 60))
 # Se True, mensagens vencidas na subida são ignoradas (não disparam, ficam no Redis)
 SKIP_OVERDUE_ON_STARTUP = os.getenv('SKIP_OVERDUE_ON_STARTUP', 'false').lower() == 'true'
 
+# Máximo de webhooks disparando em paralelo (evita travar o servidor)
+WEBHOOK_MAX_CONCURRENT = int(os.getenv('WEBHOOK_MAX_CONCURRENT', 5))
+webhook_semaphore = threading.Semaphore(WEBHOOK_MAX_CONCURRENT)
+
 
 def log(msg: str):
     print(f"[{datetime.utcnow().isoformat()}] {msg}")
@@ -121,6 +125,11 @@ def _iter_message_keys_by_filter(prefix: Optional[str] = None, contains: Optiona
 
 
 def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any]):
+    with webhook_semaphore:
+        _fire_webhook_inner(message_id, webhook_url, payload)
+
+
+def _fire_webhook_inner(message_id: str, webhook_url: str, payload: Dict[str, Any]):
     internal_url = _rewrite_webhook_url(webhook_url)
     if internal_url != webhook_url:
         log(f"URL rewritten for {message_id}: {webhook_url} -> {internal_url}")
