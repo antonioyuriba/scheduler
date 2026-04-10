@@ -336,7 +336,9 @@ def restore_scheduled_messages():
 
 @app.on_event("startup")
 def _startup():
-    restore_scheduled_messages()
+    # Roda restore em thread separada para não bloquear o event loop do FastAPI
+    t0 = threading.Thread(target=restore_scheduled_messages, daemon=True)
+    t0.start()
 
     t1 = threading.Thread(target=scheduler_worker, daemon=True)
     t1.start()
