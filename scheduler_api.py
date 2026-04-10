@@ -25,7 +25,7 @@ API_TOKEN = os.getenv('API_TOKEN')
 # Reescreve URLs externas do n8n para a rota interna Docker,
 # evitando timeout por hairpin NAT (mesmo servidor).
 N8N_EXTERNAL_HOST = os.getenv('N8N_EXTERNAL_HOST', 'n8n-prod.byiatech.com.br')
-N8N_INTERNAL_URL = os.getenv('N8N_INTERNAL_URL', 'http://172.18.0.7:5678')
+N8N_INTERNAL_URL = os.getenv('N8N_INTERNAL_URL', 'http://172.18.0.6:5678')
 
 # Retry config
 WEBHOOK_MAX_RETRIES = int(os.getenv('WEBHOOK_MAX_RETRIES', 3))
