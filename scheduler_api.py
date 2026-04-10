@@ -342,28 +342,47 @@ def sweep_failed_messages():
 
 
 def restore_scheduled_messages():
-    """Restaura jobs a partir do Redis usando SCAN."""
-    try:
-        restored_count = 0
-        for key in redis_client.scan_iter(match="message:*", count=1000):
-            try:
-                raw = redis_client.get(key)
-                if not raw:
-                    continue
-                data = json.loads(raw)
-                schedule_message(
-                    data["id"],
-                    data["scheduleTo"],
-                    data["webhookUrl"],
-                    data["payload"],
-                )
-                restored_count += 1
-                log(f"Restored scheduled message - ID: {data['id']}")
-            except Exception as e:
-                log(f"Failed to restore message {key}: {e}")
-        log(f"Restored {restored_count} scheduled messages from Redis")
-    except Exception as e:
-        log(f"Error restoring messages: {e}")
+      """Restaura jobs a partir do Redis usando SCAN."""                                                                                                                                                                                                                                                                                                                
+      try:
+          restored_count = 0                                                                                                                                                                                                                                                                                                                                            
+          skipped_count = 0
+          now = datetime.now().astimezone().replace(tzinfo=None)                                                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                                                                                                                        
+          for key in redis_client.scan_iter(match="message:*", count=1000):
+              try:                                                                                                                                                                                                                                                                                                                                                      
+                  raw = redis_client.get(key)
+                  if not raw:
+                      continue
+                  data = json.loads(raw)                                                                                                                                                                                                                                                                                                                                
+   
+                  if SKIP_OVERDUE_ON_STARTUP:                                                                                                                                                                                                                                                                                                                           
+                      schedule_to = data.get("scheduleTo", "")
+                      try:                                                                                                                                                                                                                                                                                                                                              
+                          schedule_time = datetime.fromisoformat(
+                              schedule_to.replace('Z', '+00:00')                                                                                                                                                                                                                                                                                                        
+                          ).astimezone().replace(tzinfo=None)
+                          if schedule_time <= now:                                                                                                                                                                                                                                                                                                                      
+                              redis_client.delete(key)
+                              log(f"[STARTUP] Skipping overdue message {data['id']} (was: {schedule_to})")                                                                                                                                                                                                                                                              
+                              skipped_count += 1                                                                                                                                                                                                                                                                                                                        
+                              continue                                                                                                                                                                                                                                                                                                                                  
+                      except Exception:                                                                                                                                                                                                                                                                                                                                 
+                          pass  # scheduleTo inválido — deixa passar, schedule_message vai lidar                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                                                                                                                        
+                  schedule_message(                                                                                                                                                                                                                                                                                                                                     
+                      data["id"],                                                                                                                                                                                                                                                                                                                                       
+                      data["scheduleTo"],                                                                                                                                                                                                                                                                                                                               
+                      data["webhookUrl"],
+                      data["payload"],
+                  )
+                  restored_count += 1
+                  log(f"Restored scheduled message - ID: {data['id']}")
+              except Exception as e:                                                                                                                                                                                                                                                                                                                                    
+                  log(f"Failed to restore message {key}: {e}")
+                                                                                                                                                                                                                                                                                                                                                                        
+          log(f"Restored {restored_count} scheduled messages | Skipped {skipped_count} overdue")
+      except Exception as e:                                                                                                                                                                                                                                                                                                                                            
+          log(f"Error restoring messages: {e}")
 
 
 @app.on_event("startup")
