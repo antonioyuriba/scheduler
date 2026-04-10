@@ -221,7 +221,12 @@ def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str,
         local_dt = schedule_time.astimezone().replace(tzinfo=None)
 
         def job():
-            fire_webhook(message_id, webhook_url, payload)
+            t = threading.Thread(
+                target=fire_webhook,
+                args=(message_id, webhook_url, payload),
+                daemon=True
+            )
+            t.start()
             return schedule.CancelJob
 
         job_instance = schedule.every().day.at(local_dt.strftime("%H:%M:%S")).do(job).tag(message_id)
