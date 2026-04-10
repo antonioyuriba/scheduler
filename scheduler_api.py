@@ -36,6 +36,10 @@ SWEEP_INTERVAL = int(os.getenv('SWEEP_INTERVAL', 60))
 # Se True, mensagens vencidas na subida são ignoradas (não disparam, ficam no Redis)
 SKIP_OVERDUE_ON_STARTUP = os.getenv('SKIP_OVERDUE_ON_STARTUP', 'false').lower() == 'true'
 
+# Mensagens mais antigas que este limite (em horas) são descartadas e removidas do Redis
+# Use 0 para desabilitar o limite
+MESSAGE_MAX_AGE_HOURS = int(os.getenv('MESSAGE_MAX_AGE_HOURS', 24))
+
 # Máximo de webhooks disparando em paralelo (evita travar o servidor)
 WEBHOOK_MAX_CONCURRENT = int(os.getenv('WEBHOOK_MAX_CONCURRENT', 5))
 webhook_semaphore = threading.Semaphore(WEBHOOK_MAX_CONCURRENT)
@@ -43,6 +47,17 @@ webhook_semaphore = threading.Semaphore(WEBHOOK_MAX_CONCURRENT)
 
 def log(msg: str):
     print(f"[{datetime.utcnow().isoformat()}] {msg}")
+
+
+def _is_too_old(schedule_timestamp: str) -> bool:
+    if MESSAGE_MAX_AGE_HOURS <= 0:
+        return False
+    try:
+        schedule_time = datetime.fromisoformat(schedule_timestamp.replace('Z', '+00:00'))
+        age = datetime.now(schedule_time.tzinfo) - schedule_time
+        return age.total_seconds() > MESSAGE_MAX_AGE_HOURS * 3600
+    except Exception:
+        return False
 
 
 def verify_token(authorization: str = Header(None)):
@@ -209,6 +224,14 @@ def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str,
         now = datetime.now(schedule_time.tzinfo)
 
         if schedule_time <= now:
+            age_seconds = (now - schedule_time).total_seconds()
+            if MESSAGE_MAX_AGE_HOURS > 0 and age_seconds > MESSAGE_MAX_AGE_HOURS * 3600:
+                log(f"Message {message_id} is too old ({age_seconds/3600:.1f}h > {MESSAGE_MAX_AGE_HOURS}h limit), discarding")
+                try:
+                    redis_client.delete(f"message:{message_id}")
+                except Exception:
+                    pass
+                return
             log(f"Message {message_id} is in the past ({schedule_timestamp}), firing immediately")
             t = threading.Thread(
                 target=fire_webhook,
@@ -276,6 +299,14 @@ def sweep_failed_messages():
                                 schedule_message(msg_id, schedule_to, data["webhookUrl"], data["payload"])
                         continue
 
+                    if _is_too_old(schedule_to):
+                        log(f"[SWEEP] Message {msg_id} is too old, removing from Redis")
+                        try:
+                            redis_client.delete(key)
+                        except Exception:
+                            pass
+                        continue
+
                     with schedule_lock:
                         has_job = msg_id in scheduled_jobs
 
@@ -324,6 +355,12 @@ def restore_scheduled_messages():
                 if not raw:
                     continue
                 data = json.loads(raw)
+
+                if _is_too_old(data.get("scheduleTo", "")):
+                    log(f"[STARTUP] Message {data.get('id')} is too old, removing from Redis")
+                    redis_client.delete(key)
+                    skipped_count += 1
+                    continue
 
                 if SKIP_OVERDUE_ON_STARTUP:
                     try:
