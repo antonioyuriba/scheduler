@@ -4,6 +4,11 @@ FROM python:3.11-slim
 # Instala dependências básicas
 RUN apt-get update && apt-get install -y gcc
 
+# Timezone UTC: a lib `schedule` usa datetime.now() local naive; fixar TZ=UTC
+# garante que "local" == "UTC" e evita o bug clássico de agendamento fora de UTC.
+# python:3.11-slim já usa UTC por default; ENV explícito documenta o contrato.
+ENV TZ=UTC
+
 # Set working directory
 WORKDIR /app
 

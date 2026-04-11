@@ -2,8 +2,25 @@ import json
 import os
 import time
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional
+
+UTC = timezone.utc
+
+
+def now_utc() -> datetime:
+    return datetime.now(UTC)
+
+
+def parse_iso_to_utc(value: str) -> datetime:
+    """
+    Converte ISO-8601 (com Z, com offset, ou naive) para aware UTC.
+    Naive é interpretado como UTC (política explícita).
+    """
+    dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 import redis
 import requests
@@ -42,8 +59,12 @@ SWEEP_INTERVAL = int(os.getenv('SWEEP_INTERVAL', 60))
 SKIP_OVERDUE_ON_STARTUP = os.getenv('SKIP_OVERDUE_ON_STARTUP', 'false').lower() == 'true'
 
 # Mensagens mais antigas que este limite (em horas) são descartadas e removidas do Redis
-# Use 0 para desabilitar o limite
-MESSAGE_MAX_AGE_HOURS = int(os.getenv('MESSAGE_MAX_AGE_HOURS', 24))
+# Aceita valores fracionários (ex.: 0.5 = 30min). Use 0 para desabilitar o limite.
+MESSAGE_MAX_AGE_HOURS = float(os.getenv('MESSAGE_MAX_AGE_HOURS', '24'))
+
+# Tolerância (segundos) para aceitar scheduleTo levemente no passado sem
+# rejeitar com 400. Acima disso, POST /messages retorna 400.
+PAST_SCHEDULE_TOLERANCE_SECONDS = int(os.getenv('PAST_SCHEDULE_TOLERANCE_SECONDS', '30'))
 
 # Máximo de webhooks disparando em paralelo (evita travar o servidor)
 WEBHOOK_MAX_CONCURRENT = int(os.getenv('WEBHOOK_MAX_CONCURRENT', 5))
@@ -51,15 +72,15 @@ webhook_semaphore = threading.Semaphore(WEBHOOK_MAX_CONCURRENT)
 
 
 def log(msg: str):
-    print(f"[{datetime.utcnow().isoformat()}] {msg}")
+    print(f"[{now_utc().isoformat()}] {msg}")
 
 
 def _is_too_old(schedule_timestamp: str) -> bool:
     if MESSAGE_MAX_AGE_HOURS <= 0:
         return False
     try:
-        schedule_time = datetime.fromisoformat(schedule_timestamp.replace('Z', '+00:00'))
-        age = datetime.now(schedule_time.tzinfo) - schedule_time
+        schedule_time = parse_iso_to_utc(schedule_timestamp)
+        age = now_utc() - schedule_time
         return age.total_seconds() > MESSAGE_MAX_AGE_HOURS * 3600
     except Exception:
         return False
@@ -226,7 +247,7 @@ def _fire_webhook_inner(message_id: str, webhook_url: str, payload: Dict[str, An
         raw = redis_client.get(f"message:{message_id}")
         if raw:
             data = json.loads(raw)
-            data["_lastFailure"] = datetime.utcnow().isoformat()
+            data["_lastFailure"] = now_utc().isoformat()
             data["_lastError"] = str(last_error)
             data["_failCount"] = data.get("_failCount", 0) + 1
             redis_client.set(f"message:{message_id}", json.dumps(data))
@@ -247,13 +268,13 @@ def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str,
             schedule.clear(message_id)
             scheduled_jobs.pop(message_id, None)
 
-        schedule_time = datetime.fromisoformat(schedule_timestamp.replace('Z', '+00:00'))
-        now = datetime.now(schedule_time.tzinfo)
+        schedule_time_utc = parse_iso_to_utc(schedule_timestamp)
+        now = now_utc()
 
-        if schedule_time <= now:
-            age_seconds = (now - schedule_time).total_seconds()
+        if schedule_time_utc <= now:
+            age_seconds = (now - schedule_time_utc).total_seconds()
             if MESSAGE_MAX_AGE_HOURS > 0 and age_seconds > MESSAGE_MAX_AGE_HOURS * 3600:
-                log(f"Message {message_id} is too old ({age_seconds/3600:.1f}h > {MESSAGE_MAX_AGE_HOURS}h limit), discarding")
+                log(f"Message {message_id} is too old ({age_seconds/3600:.2f}h > {MESSAGE_MAX_AGE_HOURS}h limit), discarding")
                 try:
                     redis_client.delete(f"message:{message_id}")
                 except Exception:
@@ -268,7 +289,10 @@ def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str,
             t.start()
             return
 
-        local_dt = schedule_time.astimezone().replace(tzinfo=None)
+        # A lib `schedule` usa datetime.now() local naive para run_pending().
+        # Convertemos para local naive APENAS aqui para preencher next_run.
+        # Requer TZ=UTC no container (recomendado).
+        local_dt = schedule_time_utc.astimezone().replace(tzinfo=None)
 
         def job():
             t = threading.Thread(
@@ -283,7 +307,7 @@ def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str,
         job_instance.next_run = local_dt
 
         scheduled_jobs[message_id] = job_instance
-        log(f"Message {message_id} scheduled for {local_dt.isoformat()} (local time)")
+        log(f"Message {message_id} scheduled for {schedule_time_utc.isoformat()} UTC")
 
 
 def scheduler_worker():
@@ -300,7 +324,7 @@ def sweep_failed_messages():
     while True:
         try:
             time.sleep(SWEEP_INTERVAL)
-            now = datetime.utcnow()
+            now = now_utc()
             swept = 0
 
             for key in redis_client.scan_iter(match="message:*", count=1000):
@@ -316,10 +340,9 @@ def sweep_failed_messages():
                     if not msg_id or not schedule_to:
                         continue
 
-                    schedule_time = datetime.fromisoformat(schedule_to.replace('Z', '+00:00'))
-                    schedule_utc = schedule_time.astimezone().replace(tzinfo=None)
+                    schedule_time_utc = parse_iso_to_utc(schedule_to)
 
-                    if schedule_utc > now:
+                    if schedule_time_utc > now:
                         with schedule_lock:
                             if msg_id not in scheduled_jobs:
                                 log(f"[SWEEP] Re-scheduling future message {msg_id} (scheduleTo: {schedule_to})")
@@ -341,7 +364,7 @@ def sweep_failed_messages():
                         last_failure = data.get("_lastFailure")
                         if last_failure:
                             try:
-                                last_fail_time = datetime.fromisoformat(last_failure)
+                                last_fail_time = parse_iso_to_utc(last_failure)
                                 if (now - last_fail_time).total_seconds() < 300:
                                     continue
                             except Exception:
@@ -374,7 +397,7 @@ def restore_scheduled_messages():
     try:
         restored_count = 0
         skipped_count = 0
-        now = datetime.now().astimezone().replace(tzinfo=None)
+        now = now_utc()
 
         for key in redis_client.scan_iter(match="message:*", count=1000):
             try:
@@ -391,10 +414,8 @@ def restore_scheduled_messages():
 
                 if SKIP_OVERDUE_ON_STARTUP:
                     try:
-                        schedule_time = datetime.fromisoformat(
-                            data.get("scheduleTo", "").replace('Z', '+00:00')
-                        ).astimezone().replace(tzinfo=None)
-                        if schedule_time <= now:
+                        schedule_time_utc = parse_iso_to_utc(data.get("scheduleTo", ""))
+                        if schedule_time_utc <= now:
                             log(f"[STARTUP] Bypassing overdue message {data['id']} (kept in Redis)")
                             skipped_count += 1
                             continue  # não agenda, não deleta
@@ -434,6 +455,26 @@ def _startup():
 @app.post("/messages")
 async def create_scheduled_message(message: ScheduleMessage, token: str = Depends(verify_token)):
     try:
+        try:
+            schedule_time_utc = parse_iso_to_utc(message.scheduleTo)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid scheduleTo format (expected ISO-8601): {e}"
+            )
+
+        threshold = now_utc() - timedelta(seconds=PAST_SCHEDULE_TOLERANCE_SECONDS)
+        if schedule_time_utc < threshold:
+            age_seconds = (now_utc() - schedule_time_utc).total_seconds()
+            log(f"Rejecting past scheduleTo - ID: {message.id} ({age_seconds:.0f}s in the past)")
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"scheduleTo is in the past ({message.scheduleTo}); "
+                    f"refusing to schedule. Tolerance: {PAST_SCHEDULE_TOLERANCE_SECONDS}s."
+                )
+            )
+
         redis_key = f"message:{message.id}"
 
         if redis_client.exists(redis_key):
@@ -455,6 +496,8 @@ async def create_scheduled_message(message: ScheduleMessage, token: str = Depend
 
         return {"status": "scheduled", "messageId": message.id}
 
+    except HTTPException:
+        raise
     except Exception as e:
         log(f"Error in create: {type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to schedule message: {str(e)}")
@@ -650,7 +693,7 @@ async def stats(token: str = Depends(verify_token)):
         total_redis = 0
         failed_count = 0
         overdue_count = 0
-        now = datetime.utcnow()
+        now = now_utc()
 
         for key in redis_client.scan_iter(match="message:*", count=1000):
             total_redis += 1
@@ -661,9 +704,11 @@ async def stats(token: str = Depends(verify_token)):
                     failed_count += 1
                 schedule_to = data.get("scheduleTo")
                 if schedule_to:
-                    st = datetime.fromisoformat(schedule_to.replace('Z', '+00:00'))
-                    if st.astimezone().replace(tzinfo=None) <= now:
-                        overdue_count += 1
+                    try:
+                        if parse_iso_to_utc(schedule_to) <= now:
+                            overdue_count += 1
+                    except Exception:
+                        pass
 
         with schedule_lock:
             job_count = len(schedule.jobs)
