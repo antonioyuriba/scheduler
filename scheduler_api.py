@@ -3,8 +3,10 @@ import os
 import time
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, Optional
+from queue import Empty, Full, Queue
+from typing import Any, Callable, Dict, Optional, Tuple
 
 UTC = timezone.utc
 
@@ -56,7 +58,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Scheduler API", version="2.4.0")
+app = FastAPI(title="Scheduler API", version="2.5.0")
 
 API_TOKEN = os.getenv('API_TOKEN')
 
@@ -103,7 +105,25 @@ RETRY_DEADLINE_HOURS = float(os.getenv('RETRY_DEADLINE_HOURS', '6'))
 
 # Máximo de webhooks disparando em paralelo (evita travar o servidor)
 WEBHOOK_MAX_CONCURRENT = int(os.getenv('WEBHOOK_MAX_CONCURRENT', 5))
-webhook_semaphore = threading.Semaphore(WEBHOOK_MAX_CONCURRENT)
+
+# Pool fixo de worker threads para disparos reais. Substitui a antiga
+# combinação "threading.Thread + Semaphore" que podia criar milhares de
+# threads paradas em uma rajada.
+webhook_executor = ThreadPoolExecutor(
+    max_workers=WEBHOOK_MAX_CONCURRENT,
+    thread_name_prefix="webhook",
+)
+
+# Fila intermediária entre "job() do schedule lib" e "webhook_executor.submit()".
+# Esta separação evita que job() fique bloqueado num submit() lotado segurando
+# o schedule_lock — o que travaria todas as rotas HTTP e outros workers.
+# job() só faz put_nowait (nunca bloqueia); um dispatcher_worker separado
+# consome a fila e faz submit fora de qualquer lock.
+DISPATCH_QUEUE_SIZE = int(os.getenv('DISPATCH_QUEUE_SIZE', '5000'))
+dispatch_queue: "Queue[Optional[Tuple[str, str, Dict[str, Any], str]]]" = Queue(maxsize=DISPATCH_QUEUE_SIZE)
+
+# Event global usado para sinalizar shutdown aos workers de background.
+shutdown_event = threading.Event()
 
 
 def _worst_case_fire_seconds() -> int:
@@ -465,39 +485,84 @@ def _iter_message_keys_by_filter(prefix: Optional[str] = None, contains: Optiona
             pass
 
 
+def _enqueue_for_dispatch(
+    message_id: str,
+    webhook_url: str,
+    payload: Dict[str, Any],
+    version: str,
+) -> bool:
+    """
+    Enfileira uma mensagem para disparo. **NÃO BLOQUEIA.**
+    Retorna True se entrou na fila; False se a fila está cheia (overflow).
+    Em overflow, a mensagem permanece no Redis — o sweep tenta de novo mais tarde.
+    """
+    try:
+        dispatch_queue.put_nowait((message_id, webhook_url, payload, version))
+        return True
+    except Full:
+        log(f"[DISPATCH] queue overflow ({DISPATCH_QUEUE_SIZE}); {message_id} will be retried by sweep")
+        return False
+
+
+def dispatcher_worker():
+    """
+    Consome dispatch_queue e submete ao webhook_executor. Este worker é o
+    ÚNICO ponto onde executor.submit() pode bloquear em contenção, e está
+    isolado de qualquer lock sensível (especialmente schedule_lock).
+    """
+    log("Dispatcher worker started")
+    while not shutdown_event.is_set():
+        try:
+            item = dispatch_queue.get(timeout=1)
+        except Empty:
+            continue
+        if item is None:
+            # Sentinel de shutdown
+            dispatch_queue.task_done()
+            break
+        msg_id, url, payload, version = item
+        try:
+            webhook_executor.submit(fire_webhook, msg_id, url, payload, version)
+        except Exception as e:
+            log(f"[DISPATCHER] failed to submit {msg_id}: {e}")
+        finally:
+            dispatch_queue.task_done()
+    log("Dispatcher worker stopped")
+
+
 def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any], expected_version: str):
     """
-    Entry point do disparo. Fluxo:
-      1. Espera slot do webhook_semaphore (limita paralelismo).
-      2. Tenta claim distribuído (SET NX). Se falha, outro processo já está
-         disparando essa mensagem — skip silencioso.
-      3. Inicia thread de heartbeat que renova o lease periodicamente.
-      4. Delega para _fire_webhook_inner, que faz CAS + POST + CAS.
-      5. Sempre no finally: libera heartbeat e claim.
+    Entry point do disparo — roda dentro de uma worker thread do
+    webhook_executor. Fluxo:
+      1. Tenta claim distribuído (SET NX). Se falha, skip silencioso.
+      2. Inicia heartbeat thread que renova o lease periodicamente.
+      3. Delega para _fire_webhook_inner (CAS + POST + CAS).
+      4. Finally: libera heartbeat e claim.
+    A limitação de paralelismo agora vem de webhook_executor.max_workers,
+    não mais de um Semaphore.
     """
-    with webhook_semaphore:
-        token = _try_claim(message_id)
-        if not token:
-            log(f"[{message_id}] claim unavailable — another instance is processing; skipping")
-            return
+    token = _try_claim(message_id)
+    if not token:
+        log(f"[{message_id}] claim unavailable — another instance is processing; skipping")
+        return
 
-        stop_hb = threading.Event()
+    stop_hb = threading.Event()
 
-        def _hb():
-            while not stop_hb.wait(INFLIGHT_HEARTBEAT_SECONDS):
-                if not _renew_claim(message_id, token):
-                    log(f"[{message_id}] lost claim during execution (token expired or stolen)")
-                    stop_hb.set()
-                    return
+    def _hb():
+        while not stop_hb.wait(INFLIGHT_HEARTBEAT_SECONDS):
+            if not _renew_claim(message_id, token):
+                log(f"[{message_id}] lost claim during execution (token expired or stolen)")
+                stop_hb.set()
+                return
 
-        hb_thread = threading.Thread(target=_hb, daemon=True, name=f"hb-{message_id[:16]}")
-        hb_thread.start()
+    hb_thread = threading.Thread(target=_hb, daemon=True, name=f"hb-{message_id[:16]}")
+    hb_thread.start()
 
-        try:
-            _fire_webhook_inner(message_id, webhook_url, payload, expected_version)
-        finally:
-            stop_hb.set()
-            _release_claim(message_id, token)
+    try:
+        _fire_webhook_inner(message_id, webhook_url, payload, expected_version)
+    finally:
+        stop_hb.set()
+        _release_claim(message_id, token)
 
 
 def _clear_scheduled_memory(message_id: str) -> None:
@@ -629,12 +694,10 @@ def schedule_message(
         captured_version = version
 
         def job():
-            t = threading.Thread(
-                target=fire_webhook,
-                args=(message_id, webhook_url, payload, captured_version),
-                daemon=True
-            )
-            t.start()
+            # Roda dentro de schedule.run_pending() sob schedule_lock.
+            # NÃO BLOQUEIA: só enfileira no dispatch_queue. O dispatcher
+            # separado é quem chama webhook_executor.submit() fora de qualquer lock.
+            _enqueue_for_dispatch(message_id, webhook_url, payload, captured_version)
             return schedule.CancelJob
 
         job_instance = schedule.every().day.at(local_dt.strftime("%H:%M:%S")).do(job).tag(message_id)
@@ -645,19 +708,21 @@ def schedule_message(
 
 
 def scheduler_worker():
-    while True:
+    while not shutdown_event.is_set():
         try:
             with schedule_lock:
                 schedule.run_pending()
         except Exception as e:
             log(f"Error in scheduler_worker: {e}")
-        time.sleep(1)
+        if shutdown_event.wait(timeout=1):
+            break
 
 
 def sweep_failed_messages():
-    while True:
+    while not shutdown_event.is_set():
         try:
-            time.sleep(SWEEP_INTERVAL)
+            if shutdown_event.wait(timeout=SWEEP_INTERVAL):
+                break
             now = now_utc()
             swept = 0
 
@@ -753,13 +818,8 @@ def sweep_failed_messages():
                                 pass
 
                         log(f"[SWEEP] Retrying overdue message {msg_id} (failCount: {fail_count}, v={current_version[:8]})")
-                        swept += 1
-                        t = threading.Thread(
-                            target=fire_webhook,
-                            args=(msg_id, data["webhookUrl"], data["payload"], current_version),
-                            daemon=True
-                        )
-                        t.start()
+                        if _enqueue_for_dispatch(msg_id, data["webhookUrl"], data["payload"], current_version):
+                            swept += 1
 
                 except Exception as e:
                     log(f"[SWEEP] Error processing {key}: {e}")
@@ -847,16 +907,34 @@ def restore_scheduled_messages():
 @app.on_event("startup")
 def _startup():
     # Roda restore em thread separada para não bloquear o event loop do FastAPI
-    t0 = threading.Thread(target=restore_scheduled_messages, daemon=True)
+    t0 = threading.Thread(target=restore_scheduled_messages, daemon=True, name="restore")
     t0.start()
 
-    t1 = threading.Thread(target=scheduler_worker, daemon=True)
+    t1 = threading.Thread(target=scheduler_worker, daemon=True, name="scheduler")
     t1.start()
 
-    t2 = threading.Thread(target=sweep_failed_messages, daemon=True)
+    t2 = threading.Thread(target=sweep_failed_messages, daemon=True, name="sweep")
     t2.start()
 
-    log("Scheduler API started with retry support and sweep worker")
+    t3 = threading.Thread(target=dispatcher_worker, daemon=True, name="dispatcher")
+    t3.start()
+
+    log(f"Scheduler API started — containerId={CONTAINER_ID}, workers=4, pool={WEBHOOK_MAX_CONCURRENT}, dispatchQueue={DISPATCH_QUEUE_SIZE}")
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    log("Shutdown requested — draining workers")
+    shutdown_event.set()
+    try:
+        dispatch_queue.put_nowait(None)  # sentinel para o dispatcher sair
+    except Full:
+        pass
+    try:
+        webhook_executor.shutdown(wait=True, cancel_futures=False)
+    except Exception as e:
+        log(f"Error shutting down executor: {e}")
+    log("Shutdown complete")
 
 
 # =======================
@@ -1065,9 +1143,12 @@ async def health_check():
         "redis": "unknown",
         "n8nInternal": "not_configured",
         "n8nExternal": "unknown",
-        "version": "2.4.0",
+        "version": "2.5.0",
         "containerId": CONTAINER_ID,
         "inflightTtlSeconds": INFLIGHT_TTL_SECONDS,
+        "webhookPoolSize": WEBHOOK_MAX_CONCURRENT,
+        "dispatchQueueSize": DISPATCH_QUEUE_SIZE,
+        "dispatchQueueDepth": dispatch_queue.qsize(),
     }
 
     try:
@@ -1245,5 +1326,5 @@ async def list_dead_versions(message_id: str, token: str = Depends(verify_token)
 
 
 if __name__ == "__main__":
-    log("Starting Scheduler API server v2.4.0")
+    log("Starting Scheduler API server v2.5.0")
     uvicorn.run(app, host="0.0.0.0", port=8000)
