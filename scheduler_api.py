@@ -5,6 +5,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from queue import Empty, Full, Queue
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -58,7 +59,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Scheduler API", version="2.5.0")
+app = FastAPI(title="Scheduler API", version="2.6.0")
 
 API_TOKEN = os.getenv('API_TOKEN')
 
@@ -145,6 +146,110 @@ INFLIGHT_HEARTBEAT_SECONDS = max(5, INFLIGHT_TTL_SECONDS // 4)
 
 # Identidade deste processo — aparece no valor do lock para debug/auditoria.
 CONTAINER_ID = f"{os.uname().nodename}:{uuid.uuid4().hex[:8]}"
+
+# Rate limiter temporal: garante no máximo N disparos/segundo no agregado,
+# independente do tamanho do pool. Evita a "avalanche" quando muita mensagem
+# acumula e é liberada de uma vez. Default conservador 2/s.
+WEBHOOK_MAX_PER_SECOND = float(os.getenv('WEBHOOK_MAX_PER_SECOND', '2'))
+
+
+class RateLimiter:
+    """
+    Leaky bucket simples baseado em time.monotonic. Serializa chamadas para
+    garantir um intervalo mínimo entre elas. O sleep acontece dentro do lock
+    por design — isso sequencializa os workers do pool e deixa o rate limit
+    ser o gargalo observável.
+    """
+
+    def __init__(self, rate_per_second: float):
+        self.min_interval = 1.0 / rate_per_second if rate_per_second > 0 else 0.0
+        self._lock = threading.Lock()
+        self._last_call = 0.0
+
+    def acquire(self) -> float:
+        if self.min_interval <= 0:
+            return 0.0
+        with self._lock:
+            now = time.monotonic()
+            wait = self.min_interval - (now - self._last_call)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_call = time.monotonic()
+            return max(0.0, wait)
+
+
+fire_rate_limiter = RateLimiter(WEBHOOK_MAX_PER_SECOND)
+
+# Circuit breaker: se o webhook destino estiver totalmente fora, paramos de
+# tentar em loop e entramos em modo OPEN por CB_COOLDOWN_SECONDS. Ao fim do
+# cooldown, passa para HALF_OPEN e deixa um probe passar. Sucesso fecha; falha
+# volta para OPEN.
+CB_FAILURE_THRESHOLD = int(os.getenv('CB_FAILURE_THRESHOLD', '5'))
+CB_COOLDOWN_SECONDS = int(os.getenv('CB_COOLDOWN_SECONDS', '60'))
+
+
+class CircuitState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int, cooldown_seconds: int):
+        self.failure_threshold = failure_threshold
+        self.cooldown = cooldown_seconds
+        self.state = CircuitState.CLOSED
+        self.failures = 0
+        self.opened_at = 0.0
+        self._lock = threading.Lock()
+
+    def allow(self) -> bool:
+        with self._lock:
+            if self.state == CircuitState.CLOSED:
+                return True
+            if self.state == CircuitState.OPEN:
+                if time.monotonic() - self.opened_at >= self.cooldown:
+                    self.state = CircuitState.HALF_OPEN
+                    log("[CB] cooldown elapsed; HALF_OPEN — allowing probe")
+                    return True
+                return False
+            # HALF_OPEN: deixa passar um probe por vez (não é estritamente um
+            # por vez pois não sequencializa, mas na prática o rate limiter já
+            # serializa chamadas; aceitável).
+            return True
+
+    def record_success(self) -> None:
+        with self._lock:
+            if self.state != CircuitState.CLOSED:
+                log("[CB] success — circuit CLOSED (webhook recovered)")
+            self.failures = 0
+            self.state = CircuitState.CLOSED
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self.failures += 1
+            if self.state == CircuitState.HALF_OPEN:
+                self.state = CircuitState.OPEN
+                self.opened_at = time.monotonic()
+                log("[CB] probe failed — circuit back to OPEN")
+                return
+            if self.state == CircuitState.CLOSED and self.failures >= self.failure_threshold:
+                self.state = CircuitState.OPEN
+                self.opened_at = time.monotonic()
+                log(f"[CB] threshold {self.failure_threshold} reached — circuit OPEN for {self.cooldown}s")
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "state": self.state.value,
+                "failures": self.failures,
+                "openedAt": self.opened_at,
+                "cooldownSeconds": self.cooldown,
+                "failureThreshold": self.failure_threshold,
+            }
+
+
+circuit_breaker = CircuitBreaker(CB_FAILURE_THRESHOLD, CB_COOLDOWN_SECONDS)
 
 
 def log(msg: str):
@@ -584,6 +689,25 @@ def _fire_webhook_inner(
     if internal_url_preview != webhook_url:
         log(f"URL rewrite enabled for {message_id}: {webhook_url} -> {internal_url_preview} (with fallback)")
 
+    # Circuit breaker: se o destino está totalmente fora, não adianta tentar.
+    # Marcamos apenas _firstAttemptAt e _lastCbDeferral (sem mexer em status
+    # nem incrementar _failCount) para que o sweep retome assim que o CB fechar.
+    # Se não marcassemos _firstAttemptAt aqui, o sweep trataria como missed_window
+    # e mandaria para DLQ — perdendo a mensagem por falha do sistema.
+    if not circuit_breaker.allow():
+        log(f"[{message_id}] circuit breaker OPEN — deferring fire (sweep will retry)")
+
+        def _mark_cb_deferred(d: Dict[str, Any]) -> Dict[str, Any]:
+            if not d.get("_firstAttemptAt"):
+                d["_firstAttemptAt"] = now_utc().isoformat()
+            d["_lastAttempt"] = now_utc().isoformat()
+            d["_lastCbDeferral"] = now_utc().isoformat()
+            return d
+
+        update_message_cas(message_id, expected_version, _mark_cb_deferred)
+        _clear_scheduled_memory(message_id)
+        return
+
     # Transição scheduled/failed → processing via CAS. Grava _firstAttemptAt
     # (o único carimbo que autoriza retries). Se CAS falha, a mensagem foi
     # substituída ou removida — ABORTAR. Disparar a versão antiga seria
@@ -603,9 +727,17 @@ def _fire_webhook_inner(
     current_version = updated["_version"]
 
     last_error = None
+    cb_ate_failure = False
     for attempt in range(1, WEBHOOK_MAX_RETRIES + 1):
         try:
+            # Rate limit ANTES de cada tentativa: aplica throughput global
+            # independentemente do tamanho do pool.
+            waited = fire_rate_limiter.acquire()
+            if waited > 0.01:
+                log(f"[{message_id}] rate-limited wait {waited:.2f}s before attempt {attempt}")
+
             _fire_webhook_post(webhook_url, payload)
+            circuit_breaker.record_success()
             log(f"Webhook fired successfully for message {message_id} (attempt {attempt})")
 
             if _safe_delete_cas(message_id, current_version):
@@ -619,33 +751,52 @@ def _fire_webhook_inner(
         except requests.exceptions.Timeout:
             last_error = f"Timeout (attempt {attempt}/{WEBHOOK_MAX_RETRIES})"
             log(f"Webhook timeout for {message_id}: {last_error}")
+            circuit_breaker.record_failure()
         except requests.exceptions.ConnectionError as e:
             last_error = f"ConnectionError (attempt {attempt}/{WEBHOOK_MAX_RETRIES}): {e}"
             log(f"Webhook connection error for {message_id}: {last_error}")
+            circuit_breaker.record_failure()
         except requests.exceptions.HTTPError as e:
-            last_error = f"HTTP {e.response.status_code} (attempt {attempt}/{WEBHOOK_MAX_RETRIES})"
+            status_code = e.response.status_code if e.response is not None else 0
+            last_error = f"HTTP {status_code} (attempt {attempt}/{WEBHOOK_MAX_RETRIES})"
             log(f"Webhook HTTP error for {message_id}: {last_error}")
-            if e.response.status_code < 500:
-                log(f"Client error {e.response.status_code} for {message_id}, skipping retries")
+            if 400 <= status_code < 500:
+                # 4xx é erro do cliente (payload errado) — não abre circuito.
+                log(f"Client error {status_code} for {message_id}, skipping retries")
                 break
+            # 5xx: destino está problemático.
+            circuit_breaker.record_failure()
         except Exception as e:
             last_error = f"Unexpected error (attempt {attempt}/{WEBHOOK_MAX_RETRIES}): {e}"
             log(f"Webhook unexpected error for {message_id}: {last_error}")
+
+        # Antes do backoff, checa se o CB abriu agora — se abriu, interrompemos
+        # o loop interno para não queimar retries contra um destino que sabemos
+        # estar fora. O sweep retoma depois do cooldown.
+        if not circuit_breaker.allow():
+            log(f"[{message_id}] CB opened mid-retry; breaking early to let sweep retake after cooldown")
+            cb_ate_failure = True
+            break
 
         if attempt < WEBHOOK_MAX_RETRIES:
             delay = WEBHOOK_RETRY_DELAY * attempt
             log(f"Retrying {message_id} in {delay}s...")
             time.sleep(delay)
 
-    log(f"ALL {WEBHOOK_MAX_RETRIES} attempts FAILED for {message_id}. Last error: {last_error}")
+    log(f"attempts exhausted for {message_id}. Last error: {last_error}")
 
     # Transição processing → failed via CAS. Se falha, a mensagem foi
     # substituída/removida no meio do disparo — parar silenciosamente.
+    # Se o loop foi interrompido por abertura do CB, NÃO incrementamos
+    # _failCount (não é falha da mensagem, é falha do sistema).
     def _mark_failed(d: Dict[str, Any]) -> Dict[str, Any]:
-        d["_failCount"] = d.get("_failCount", 0) + 1
+        if not cb_ate_failure:
+            d["_failCount"] = d.get("_failCount", 0) + 1
         d["_lastError"] = str(last_error)
         d["_lastFailure"] = now_utc().isoformat()
         d["status"] = MessageStatus.FAILED
+        if cb_ate_failure:
+            d["_lastCbDeferral"] = now_utc().isoformat()
         return d
 
     result = update_message_cas(message_id, current_version, _mark_failed)
@@ -1143,12 +1294,14 @@ async def health_check():
         "redis": "unknown",
         "n8nInternal": "not_configured",
         "n8nExternal": "unknown",
-        "version": "2.5.0",
+        "version": "2.6.0",
         "containerId": CONTAINER_ID,
         "inflightTtlSeconds": INFLIGHT_TTL_SECONDS,
         "webhookPoolSize": WEBHOOK_MAX_CONCURRENT,
         "dispatchQueueSize": DISPATCH_QUEUE_SIZE,
         "dispatchQueueDepth": dispatch_queue.qsize(),
+        "webhookMaxPerSecond": WEBHOOK_MAX_PER_SECOND,
+        "circuitBreaker": circuit_breaker.snapshot(),
     }
 
     try:
@@ -1326,5 +1479,5 @@ async def list_dead_versions(message_id: str, token: str = Depends(verify_token)
 
 
 if __name__ == "__main__":
-    log("Starting Scheduler API server v2.5.0")
+    log("Starting Scheduler API server v2.6.0")
     uvicorn.run(app, host="0.0.0.0", port=8000)
