@@ -59,7 +59,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Scheduler API", version="2.6.0")
+app = FastAPI(title="Scheduler API", version="2.7.0")
 
 API_TOKEN = os.getenv('API_TOKEN')
 
@@ -125,6 +125,10 @@ dispatch_queue: "Queue[Optional[Tuple[str, str, Dict[str, Any], str]]]" = Queue(
 
 # Event global usado para sinalizar shutdown aos workers de background.
 shutdown_event = threading.Event()
+
+# Tempo máximo esperando o dispatch_queue drenar antes de desistir.
+# Deve ser menor que o stop_grace_period do container no Coolify.
+SHUTDOWN_DRAIN_TIMEOUT_SECONDS = int(os.getenv('SHUTDOWN_DRAIN_TIMEOUT_SECONDS', '30'))
 
 
 def _worst_case_fire_seconds() -> int:
@@ -598,9 +602,13 @@ def _enqueue_for_dispatch(
 ) -> bool:
     """
     Enfileira uma mensagem para disparo. **NÃO BLOQUEIA.**
-    Retorna True se entrou na fila; False se a fila está cheia (overflow).
-    Em overflow, a mensagem permanece no Redis — o sweep tenta de novo mais tarde.
+    Retorna True se entrou na fila; False se a fila está cheia (overflow) ou
+    se o scheduler está em shutdown. Em overflow, a mensagem permanece no
+    Redis — o sweep (ou a próxima instância após redeploy) tenta de novo.
     """
+    if shutdown_event.is_set():
+        log(f"[DISPATCH] shutdown in progress; rejecting {message_id} (sweep or next instance will retry)")
+        return False
     try:
         dispatch_queue.put_nowait((message_id, webhook_url, payload, version))
         return True
@@ -614,15 +622,26 @@ def dispatcher_worker():
     Consome dispatch_queue e submete ao webhook_executor. Este worker é o
     ÚNICO ponto onde executor.submit() pode bloquear em contenção, e está
     isolado de qualquer lock sensível (especialmente schedule_lock).
+
+    No shutdown:
+    - shutdown_event é setado
+    - _enqueue_for_dispatch rejeita novas submissões
+    - dispatcher continua drenando até a fila ficar vazia por 1s seguido OU
+      até receber o sentinel None
+    - Todos os items que estavam na fila antes do shutdown são submetidos ao
+      executor (que por sua vez os executa ou os cancela no shutdown final)
     """
     log("Dispatcher worker started")
-    while not shutdown_event.is_set():
+    while True:
         try:
             item = dispatch_queue.get(timeout=1)
         except Empty:
+            # Sem items. Se estamos em shutdown e já não há mais items, sai.
+            if shutdown_event.is_set():
+                break
             continue
         if item is None:
-            # Sentinel de shutdown
+            # Sentinel explícito
             dispatch_queue.task_done()
             break
         msg_id, url, payload, version = item
@@ -1075,16 +1094,48 @@ def _startup():
 
 @app.on_event("shutdown")
 def _shutdown():
-    log("Shutdown requested — draining workers")
+    """
+    Sequência de shutdown gracioso:
+
+    1. Set shutdown_event — a partir daqui:
+         - POST /messages retorna 503
+         - scheduler_worker e sweep_failed_messages param no próximo ciclo
+         - _enqueue_for_dispatch rejeita novas submissões
+    2. Coloca sentinel no dispatch_queue para o dispatcher sair quando drenar.
+    3. Espera o dispatch_queue ficar vazio (com timeout de SHUTDOWN_DRAIN_TIMEOUT_SECONDS).
+    4. Chama webhook_executor.shutdown(wait=True): bloqueia até os fire_webhook
+       atualmente em voo terminarem (inclui aguardar retries e rate limit).
+    5. Log final.
+
+    Total bounded em ~SHUTDOWN_DRAIN_TIMEOUT_SECONDS + worst_case_fire. O Coolify
+    deve ter stop_grace_period maior que essa soma.
+    """
+    log("Shutdown requested — starting graceful drain")
     shutdown_event.set()
+
+    # Sinaliza o dispatcher a sair assim que a fila atual for consumida.
     try:
-        dispatch_queue.put_nowait(None)  # sentinel para o dispatcher sair
+        dispatch_queue.put_nowait(None)
     except Full:
-        pass
+        log("Dispatch queue full during shutdown; dispatcher will still exit on timeout")
+
+    # Aguarda a dispatch_queue drenar (items pendentes submetidos ao executor).
+    drain_deadline = time.monotonic() + SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+    while dispatch_queue.qsize() > 0:
+        if time.monotonic() > drain_deadline:
+            log(f"Drain timeout reached with {dispatch_queue.qsize()} items still pending")
+            break
+        time.sleep(0.1)
+
+    # Aguarda os webhooks em voo terminarem.
+    # cancel_futures=True cancela futures que ainda não começaram; os que já
+    # estão rodando continuam até o fim (threads não podem ser killed).
+    log(f"Draining executor (up to worst case {_worst_case_fire_seconds()}s)")
     try:
-        webhook_executor.shutdown(wait=True, cancel_futures=False)
+        webhook_executor.shutdown(wait=True, cancel_futures=True)
     except Exception as e:
         log(f"Error shutting down executor: {e}")
+
     log("Shutdown complete")
 
 
@@ -1094,6 +1145,11 @@ def _shutdown():
 
 @app.post("/messages")
 async def create_scheduled_message(message: ScheduleMessage, token: str = Depends(verify_token)):
+    if shutdown_event.is_set():
+        raise HTTPException(
+            status_code=503,
+            detail="Scheduler is shutting down; retry on another instance",
+        )
     try:
         try:
             schedule_time_utc = parse_iso_to_utc(message.scheduleTo)
@@ -1294,7 +1350,7 @@ async def health_check():
         "redis": "unknown",
         "n8nInternal": "not_configured",
         "n8nExternal": "unknown",
-        "version": "2.6.0",
+        "version": "2.7.0",
         "containerId": CONTAINER_ID,
         "inflightTtlSeconds": INFLIGHT_TTL_SECONDS,
         "webhookPoolSize": WEBHOOK_MAX_CONCURRENT,
@@ -1302,6 +1358,7 @@ async def health_check():
         "dispatchQueueDepth": dispatch_queue.qsize(),
         "webhookMaxPerSecond": WEBHOOK_MAX_PER_SECOND,
         "circuitBreaker": circuit_breaker.snapshot(),
+        "shuttingDown": shutdown_event.is_set(),
     }
 
     try:
@@ -1339,6 +1396,11 @@ async def health_check():
         health["activeClaims"] = sum(1 for _ in redis_client.scan_iter(match="lock:message:*", count=1000))
     except Exception:
         health["activeClaims"] = None
+
+    # Draining tem prioridade sobre healthy/degraded (mas não sobre unhealthy):
+    # queremos que o balanceador externo saiba que este container está saindo.
+    if shutdown_event.is_set() and health["status"] != "unhealthy":
+        health["status"] = "draining"
 
     return health
 
@@ -1479,5 +1541,5 @@ async def list_dead_versions(message_id: str, token: str = Depends(verify_token)
 
 
 if __name__ == "__main__":
-    log("Starting Scheduler API server v2.6.0")
+    log("Starting Scheduler API server v2.7.0")
     uvicorn.run(app, host="0.0.0.0", port=8000)
