@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Scheduler API", version="2.3.0")
+app = FastAPI(title="Scheduler API", version="2.4.0")
 
 API_TOKEN = os.getenv('API_TOKEN')
 
@@ -104,6 +104,27 @@ RETRY_DEADLINE_HOURS = float(os.getenv('RETRY_DEADLINE_HOURS', '6'))
 # Máximo de webhooks disparando em paralelo (evita travar o servidor)
 WEBHOOK_MAX_CONCURRENT = int(os.getenv('WEBHOOK_MAX_CONCURRENT', 5))
 webhook_semaphore = threading.Semaphore(WEBHOOK_MAX_CONCURRENT)
+
+
+def _worst_case_fire_seconds() -> int:
+    """Tempo máximo que um fire_webhook pode levar, somando timeouts e backoff."""
+    total = 0
+    for attempt in range(1, WEBHOOK_MAX_RETRIES + 1):
+        total += WEBHOOK_TIMEOUT
+        if attempt < WEBHOOK_MAX_RETRIES:
+            total += WEBHOOK_RETRY_DELAY * attempt
+    return total + 30  # buffer
+
+
+# Claim distribuído por mensagem (evita disparo duplo em overlap de deploy):
+# - INFLIGHT_TTL_SECONDS é o TTL do lock no Redis; derivado do pior caso de retry.
+# - INFLIGHT_HEARTBEAT_SECONDS é o intervalo com que o worker renova o lease
+#   enquanto está processando. Sempre < TTL / 4 para margem ampla.
+INFLIGHT_TTL_SECONDS = int(os.getenv('INFLIGHT_TTL_SECONDS', str(_worst_case_fire_seconds())))
+INFLIGHT_HEARTBEAT_SECONDS = max(5, INFLIGHT_TTL_SECONDS // 4)
+
+# Identidade deste processo — aparece no valor do lock para debug/auditoria.
+CONTAINER_ID = f"{os.uname().nodename}:{uuid.uuid4().hex[:8]}"
 
 
 def log(msg: str):
@@ -246,6 +267,71 @@ def _safe_delete_cas(message_id: str, expected_version: str) -> bool:
     return False
 
 
+_RENEW_CLAIM_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('EXPIRE', KEYS[1], ARGV[2])
+else
+    return 0
+end
+"""
+
+_RELEASE_CLAIM_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+else
+    return 0
+end
+"""
+
+
+def _try_claim(message_id: str) -> Optional[str]:
+    """
+    Tenta adquirir o claim para uma mensagem via SET NX EX. Retorna o token
+    (valor gravado) se conseguiu, ou None se outro processo já detém o claim.
+    Usado para evitar disparo duplo em overlap de deploy (container antigo
+    drenando enquanto o novo sobe) ou em multi-replica futura.
+    """
+    token = f"{CONTAINER_ID}:{now_utc().isoformat()}"
+    try:
+        ok = redis_client.set(
+            f"lock:message:{message_id}",
+            token,
+            nx=True,
+            ex=INFLIGHT_TTL_SECONDS,
+        )
+    except Exception as e:
+        log(f"[CLAIM] try failed for {message_id}: {e}")
+        return None
+    return token if ok else None
+
+
+def _renew_claim(message_id: str, token: str) -> bool:
+    """Renova o TTL se o token ainda é nosso (atômico via Lua)."""
+    try:
+        return bool(redis_client.eval(
+            _RENEW_CLAIM_LUA,
+            1,
+            f"lock:message:{message_id}",
+            token,
+            INFLIGHT_TTL_SECONDS,
+        ))
+    except Exception:
+        return False
+
+
+def _release_claim(message_id: str, token: str) -> None:
+    """Libera apenas se o token ainda é nosso (atômico via Lua)."""
+    try:
+        redis_client.eval(
+            _RELEASE_CLAIM_LUA,
+            1,
+            f"lock:message:{message_id}",
+            token,
+        )
+    except Exception:
+        pass
+
+
 def _move_to_dlq(
     message_id: str,
     reason: str,
@@ -380,8 +466,38 @@ def _iter_message_keys_by_filter(prefix: Optional[str] = None, contains: Optiona
 
 
 def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any], expected_version: str):
+    """
+    Entry point do disparo. Fluxo:
+      1. Espera slot do webhook_semaphore (limita paralelismo).
+      2. Tenta claim distribuído (SET NX). Se falha, outro processo já está
+         disparando essa mensagem — skip silencioso.
+      3. Inicia thread de heartbeat que renova o lease periodicamente.
+      4. Delega para _fire_webhook_inner, que faz CAS + POST + CAS.
+      5. Sempre no finally: libera heartbeat e claim.
+    """
     with webhook_semaphore:
-        _fire_webhook_inner(message_id, webhook_url, payload, expected_version)
+        token = _try_claim(message_id)
+        if not token:
+            log(f"[{message_id}] claim unavailable — another instance is processing; skipping")
+            return
+
+        stop_hb = threading.Event()
+
+        def _hb():
+            while not stop_hb.wait(INFLIGHT_HEARTBEAT_SECONDS):
+                if not _renew_claim(message_id, token):
+                    log(f"[{message_id}] lost claim during execution (token expired or stolen)")
+                    stop_hb.set()
+                    return
+
+        hb_thread = threading.Thread(target=_hb, daemon=True, name=f"hb-{message_id[:16]}")
+        hb_thread.start()
+
+        try:
+            _fire_webhook_inner(message_id, webhook_url, payload, expected_version)
+        finally:
+            stop_hb.set()
+            _release_claim(message_id, token)
 
 
 def _clear_scheduled_memory(message_id: str) -> None:
@@ -949,7 +1065,9 @@ async def health_check():
         "redis": "unknown",
         "n8nInternal": "not_configured",
         "n8nExternal": "unknown",
-        "version": "2.3.0",
+        "version": "2.4.0",
+        "containerId": CONTAINER_ID,
+        "inflightTtlSeconds": INFLIGHT_TTL_SECONDS,
     }
 
     try:
@@ -982,6 +1100,11 @@ async def health_check():
             health["scheduledJobs"] = len(schedule.jobs)
     except Exception:
         health["scheduledJobs"] = None
+
+    try:
+        health["activeClaims"] = sum(1 for _ in redis_client.scan_iter(match="lock:message:*", count=1000))
+    except Exception:
+        health["activeClaims"] = None
 
     return health
 
@@ -1122,5 +1245,5 @@ async def list_dead_versions(message_id: str, token: str = Depends(verify_token)
 
 
 if __name__ == "__main__":
-    log("Starting Scheduler API server v2.3.0")
+    log("Starting Scheduler API server v2.4.0")
     uvicorn.run(app, host="0.0.0.0", port=8000)
