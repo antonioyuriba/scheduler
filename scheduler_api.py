@@ -15,15 +15,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Scheduler API", version="2.0.0")
+app = FastAPI(title="Scheduler API", version="2.1.0")
 
 API_TOKEN = os.getenv('API_TOKEN')
 
 # ==========================================
 # CONFIGURAÇÃO DE ROTA INTERNA DO N8N
 # ==========================================
+# N8N_INTERNAL_URL é OPCIONAL. Default vazio = sem rewrite, usa sempre a URL
+# pública do webhook (mais seguro: zero dependência de IP ou nome de serviço
+# Docker). Defina apenas se quiser otimizar rede interna via nome de serviço
+# estável (ex.: "http://n8n:5678"). NUNCA use IP Docker (172.x.x.x) — muda
+# quando o Coolify recria containers e derruba a aplicação.
 N8N_EXTERNAL_HOST = os.getenv('N8N_EXTERNAL_HOST', 'n8n-prod.byiatech.com.br')
-N8N_INTERNAL_URL = os.getenv('N8N_INTERNAL_URL', 'http://172.18.0.6:5678')
+N8N_INTERNAL_URL = os.getenv('N8N_INTERNAL_URL', '').strip()
 
 # Retry config
 WEBHOOK_MAX_RETRIES = int(os.getenv('WEBHOOK_MAX_RETRIES', 3))
@@ -99,13 +104,36 @@ schedule_lock = threading.RLock()
 
 
 def _rewrite_webhook_url(url: str) -> str:
-    if N8N_EXTERNAL_HOST and N8N_INTERNAL_URL:
-        if N8N_EXTERNAL_HOST in url:
-            parts = url.split(N8N_EXTERNAL_HOST, 1)
-            if len(parts) == 2:
-                path = parts[1]
-                return f"{N8N_INTERNAL_URL}{path}"
+    if N8N_EXTERNAL_HOST and N8N_INTERNAL_URL and N8N_EXTERNAL_HOST in url:
+        parts = url.split(N8N_EXTERNAL_HOST, 1)
+        if len(parts) == 2:
+            return f"{N8N_INTERNAL_URL}{parts[1]}"
     return url
+
+
+def _fire_webhook_post(webhook_url: str, payload: Dict[str, Any]) -> requests.Response:
+    """
+    Dispara o POST do webhook. Se N8N_INTERNAL_URL estiver configurado e
+    conseguir reescrever a URL, tenta o endereço interno primeiro. Em caso de
+    ConnectionError/Timeout (n8n interno indisponível), faz fallback para a
+    URL pública original. 4xx/5xx NÃO acionam fallback — são resposta legítima
+    do endpoint e devem subir para a lógica de retry.
+    """
+    internal_url = _rewrite_webhook_url(webhook_url)
+    if internal_url == webhook_url:
+        response = requests.post(webhook_url, json=payload, timeout=WEBHOOK_TIMEOUT)
+        response.raise_for_status()
+        return response
+
+    try:
+        response = requests.post(internal_url, json=payload, timeout=WEBHOOK_TIMEOUT)
+        response.raise_for_status()
+        return response
+    except (requests.ConnectionError, requests.Timeout) as e:
+        log(f"Internal URL {internal_url} unreachable ({type(e).__name__}); falling back to public {webhook_url}")
+        response = requests.post(webhook_url, json=payload, timeout=WEBHOOK_TIMEOUT)
+        response.raise_for_status()
+        return response
 
 
 def _build_next_run_map() -> Dict[str, Optional[str]]:
@@ -145,15 +173,14 @@ def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any]):
 
 
 def _fire_webhook_inner(message_id: str, webhook_url: str, payload: Dict[str, Any]):
-    internal_url = _rewrite_webhook_url(webhook_url)
-    if internal_url != webhook_url:
-        log(f"URL rewritten for {message_id}: {webhook_url} -> {internal_url}")
+    internal_url_preview = _rewrite_webhook_url(webhook_url)
+    if internal_url_preview != webhook_url:
+        log(f"URL rewrite enabled for {message_id}: {webhook_url} -> {internal_url_preview} (with fallback)")
 
     last_error = None
     for attempt in range(1, WEBHOOK_MAX_RETRIES + 1):
         try:
-            response = requests.post(internal_url, json=payload, timeout=WEBHOOK_TIMEOUT)
-            response.raise_for_status()
+            _fire_webhook_post(webhook_url, payload)
             log(f"Webhook fired successfully for message {message_id} (attempt {attempt})")
 
             try:
@@ -575,18 +602,46 @@ async def delete_scheduled_message(message_id: str, token: str = Depends(verify_
 
 @app.get("/health")
 async def health_check():
+    health: Dict[str, Any] = {
+        "status": "healthy",
+        "redis": "unknown",
+        "n8nInternal": "not_configured",
+        "n8nExternal": "unknown",
+        "version": "2.1.0",
+    }
+
     try:
         redis_client.ping()
-        with schedule_lock:
-            job_count = len(schedule.jobs)
-        return {
-            "status": "healthy",
-            "redis": "connected",
-            "scheduledJobs": job_count,
-            "version": "2.0.0",
-        }
+        health["redis"] = "connected"
     except Exception as e:
-        return {"status": "unhealthy", "redis": "disconnected", "error": str(e)}
+        health["status"] = "unhealthy"
+        health["redis"] = f"error: {type(e).__name__}"
+
+    if N8N_INTERNAL_URL:
+        try:
+            r = requests.head(N8N_INTERNAL_URL, timeout=3, allow_redirects=False)
+            health["n8nInternal"] = "reachable" if r.status_code < 500 else f"http_{r.status_code}"
+        except Exception as e:
+            health["n8nInternal"] = f"unreachable: {type(e).__name__}"
+            if health["status"] == "healthy":
+                health["status"] = "degraded"
+
+    if N8N_EXTERNAL_HOST:
+        try:
+            r = requests.head(f"https://{N8N_EXTERNAL_HOST}", timeout=5, allow_redirects=False)
+            health["n8nExternal"] = "reachable" if r.status_code < 500 else f"http_{r.status_code}"
+        except Exception as e:
+            health["n8nExternal"] = f"unreachable: {type(e).__name__}"
+            if health["status"] == "healthy":
+                health["status"] = "degraded"
+
+    try:
+        with schedule_lock:
+            health["scheduledJobs"] = len(schedule.jobs)
+    except Exception:
+        health["scheduledJobs"] = None
+
+    return health
 
 
 @app.get("/stats")
