@@ -2,8 +2,9 @@ import json
 import os
 import time
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, Optional
+from typing import Any, Callable, Dict, Optional
 
 UTC = timezone.utc
 
@@ -22,6 +23,28 @@ def parse_iso_to_utc(value: str) -> datetime:
         dt = dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
 
+
+class MessageStatus:
+    """
+    Estado explícito da máquina de estados de uma mensagem.
+    Transições válidas:
+      scheduled  → processing (início do disparo)
+      processing → sent       (2xx: seguido de delete)
+      processing → failed     (erro: enfileira retry)
+      failed     → processing (sweep retry)
+      *          → dead_letter (via _move_to_dlq)
+    O sweep só olha para scheduled e failed; nunca toca em processing.
+    """
+    SCHEDULED = "scheduled"
+    PROCESSING = "processing"
+    SENT = "sent"
+    FAILED = "failed"
+    DEAD_LETTER = "dead_letter"
+
+
+def _new_version() -> str:
+    return uuid.uuid4().hex
+
 import redis
 import redis.exceptions as redis_exceptions
 import requests
@@ -33,7 +56,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Scheduler API", version="2.2.0")
+app = FastAPI(title="Scheduler API", version="2.3.0")
 
 API_TOKEN = os.getenv('API_TOKEN')
 
@@ -134,6 +157,93 @@ class BulkDeleteFilters(BaseModel):
 
 scheduled_jobs: Dict[str, schedule.Job] = {}
 schedule_lock = threading.RLock()
+
+
+def update_message_cas(
+    message_id: str,
+    expected_version: str,
+    mutator: Callable[[Dict[str, Any]], Dict[str, Any]],
+    max_retries: int = 3,
+) -> Optional[Dict[str, Any]]:
+    """
+    Read-modify-write atômico usando WATCH + MULTI/EXEC do Redis.
+
+    - Lê a mensagem; se _version não bate com expected_version (ou se a
+      chave sumiu), retorna None sem gravar. O chamador interpreta None
+      como "a mensagem foi substituída ou removida — abortar".
+    - Aplica mutator sobre uma cópia do dict, atribui novo _version, e
+      grava de volta. Cada mutação gera uma versão nova.
+    - Em WatchError (alguém escreveu entre o WATCH e o EXEC), retry até
+      max_retries.
+    - Esta função é o único caminho permitido para qualquer RMW (exceto
+      a criação inicial no POST e a migração inline no restore). Escritas
+      cegas fora dessa disciplina são proibidas na Fase 2.
+    """
+    key = f"message:{message_id}"
+    for _attempt in range(max_retries):
+        try:
+            with redis_client.pipeline() as pipe:
+                pipe.watch(key)
+                raw = pipe.get(key)
+                if not raw:
+                    pipe.unwatch()
+                    return None
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    pipe.unwatch()
+                    return None
+                if data.get("_version") != expected_version:
+                    pipe.unwatch()
+                    return None
+                new_data = mutator(dict(data))
+                new_data["_version"] = _new_version()
+                pipe.multi()
+                pipe.set(key, json.dumps(new_data))
+                pipe.execute()
+                return new_data
+        except redis_exceptions.WatchError:
+            continue
+        except Exception as e:
+            log(f"[CAS] update failed on {message_id}: {e}")
+            return None
+    log(f"[CAS] update exhausted retries for {message_id}")
+    return None
+
+
+def _safe_delete_cas(message_id: str, expected_version: str) -> bool:
+    """
+    DELETE condicional: só remove a chave se a _version atual bate.
+    Retorna True se deletou (ou se já não existia), False se a versão
+    divergiu (alguém substituiu a mensagem enquanto disparávamos).
+    """
+    key = f"message:{message_id}"
+    for _attempt in range(3):
+        try:
+            with redis_client.pipeline() as pipe:
+                pipe.watch(key)
+                raw = pipe.get(key)
+                if not raw:
+                    pipe.unwatch()
+                    return True
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    pipe.unwatch()
+                    return False
+                if data.get("_version") != expected_version:
+                    pipe.unwatch()
+                    return False
+                pipe.multi()
+                pipe.delete(key)
+                pipe.execute()
+                return True
+        except redis_exceptions.WatchError:
+            continue
+        except Exception as e:
+            log(f"[CAS-DEL] failed on {message_id}: {e}")
+            return False
+    return False
 
 
 def _move_to_dlq(
@@ -269,28 +379,47 @@ def _iter_message_keys_by_filter(prefix: Optional[str] = None, contains: Optiona
             pass
 
 
-def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any]):
+def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any], expected_version: str):
     with webhook_semaphore:
-        _fire_webhook_inner(message_id, webhook_url, payload)
+        _fire_webhook_inner(message_id, webhook_url, payload, expected_version)
 
 
-def _fire_webhook_inner(message_id: str, webhook_url: str, payload: Dict[str, Any]):
+def _clear_scheduled_memory(message_id: str) -> None:
+    with schedule_lock:
+        scheduled_jobs.pop(message_id, None)
+        try:
+            schedule.clear(message_id)
+        except Exception:
+            pass
+
+
+def _fire_webhook_inner(
+    message_id: str,
+    webhook_url: str,
+    payload: Dict[str, Any],
+    expected_version: str,
+):
     internal_url_preview = _rewrite_webhook_url(webhook_url)
     if internal_url_preview != webhook_url:
         log(f"URL rewrite enabled for {message_id}: {webhook_url} -> {internal_url_preview} (with fallback)")
 
-    # Marca _firstAttemptAt (blind write — Fase 1). Este carimbo é o que
-    # autoriza retries futuros pelo sweep. Sem ele, a mensagem é "missed_window"
-    # e nunca será disparada. Na Fase 2, esta escrita migra para CAS.
-    try:
-        raw = redis_client.get(f"message:{message_id}")
-        if raw:
-            data = json.loads(raw)
-            if not data.get("_firstAttemptAt"):
-                data["_firstAttemptAt"] = now_utc().isoformat()
-                redis_client.set(f"message:{message_id}", json.dumps(data))
-    except Exception as e:
-        log(f"[{message_id}] Failed to mark _firstAttemptAt: {e}")
+    # Transição scheduled/failed → processing via CAS. Grava _firstAttemptAt
+    # (o único carimbo que autoriza retries). Se CAS falha, a mensagem foi
+    # substituída ou removida — ABORTAR. Disparar a versão antiga seria
+    # exatamente o race que estamos tentando prevenir.
+    def _mark_processing(d: Dict[str, Any]) -> Dict[str, Any]:
+        d["status"] = MessageStatus.PROCESSING
+        if not d.get("_firstAttemptAt"):
+            d["_firstAttemptAt"] = now_utc().isoformat()
+        d["_lastAttempt"] = now_utc().isoformat()
+        return d
+
+    updated = update_message_cas(message_id, expected_version, _mark_processing)
+    if updated is None:
+        log(f"[{message_id}] CAS mismatch before fire (expected v={expected_version[:8]}); aborting — message was replaced or removed")
+        _clear_scheduled_memory(message_id)
+        return
+    current_version = updated["_version"]
 
     last_error = None
     for attempt in range(1, WEBHOOK_MAX_RETRIES + 1):
@@ -298,19 +427,12 @@ def _fire_webhook_inner(message_id: str, webhook_url: str, payload: Dict[str, An
             _fire_webhook_post(webhook_url, payload)
             log(f"Webhook fired successfully for message {message_id} (attempt {attempt})")
 
-            try:
-                redis_client.delete(f"message:{message_id}")
+            if _safe_delete_cas(message_id, current_version):
                 log(f"Message {message_id} cleaned from Redis")
-            except Exception as redis_err:
-                log(f"WARNING: Webhook fired but failed to clean Redis for {message_id}: {redis_err}")
+            else:
+                log(f"Message {message_id} CAS mismatch on delete — newer version exists, leaving it")
 
-            with schedule_lock:
-                scheduled_jobs.pop(message_id, None)
-                try:
-                    schedule.clear(message_id)
-                except Exception:
-                    pass
-
+            _clear_scheduled_memory(message_id)
             return
 
         except requests.exceptions.Timeout:
@@ -335,28 +457,37 @@ def _fire_webhook_inner(message_id: str, webhook_url: str, payload: Dict[str, An
             time.sleep(delay)
 
     log(f"ALL {WEBHOOK_MAX_RETRIES} attempts FAILED for {message_id}. Last error: {last_error}")
-    log(f"Message {message_id} KEPT in Redis for retry on next sweep")
 
-    try:
-        raw = redis_client.get(f"message:{message_id}")
-        if raw:
-            data = json.loads(raw)
-            data["_lastFailure"] = now_utc().isoformat()
-            data["_lastError"] = str(last_error)
-            data["_failCount"] = data.get("_failCount", 0) + 1
-            redis_client.set(f"message:{message_id}", json.dumps(data))
-    except Exception:
-        pass
+    # Transição processing → failed via CAS. Se falha, a mensagem foi
+    # substituída/removida no meio do disparo — parar silenciosamente.
+    def _mark_failed(d: Dict[str, Any]) -> Dict[str, Any]:
+        d["_failCount"] = d.get("_failCount", 0) + 1
+        d["_lastError"] = str(last_error)
+        d["_lastFailure"] = now_utc().isoformat()
+        d["status"] = MessageStatus.FAILED
+        return d
 
-    with schedule_lock:
-        scheduled_jobs.pop(message_id, None)
-        try:
-            schedule.clear(message_id)
-        except Exception:
-            pass
+    result = update_message_cas(message_id, current_version, _mark_failed)
+    if result is None:
+        log(f"[{message_id}] CAS mismatch on mark_failed — message replaced/removed, stopping silently")
+    else:
+        log(f"Message {message_id} marked as failed (failCount={result.get('_failCount')}) — sweep will retry")
+
+    _clear_scheduled_memory(message_id)
 
 
-def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str, payload: Dict[str, Any]):
+def schedule_message(
+    message_id: str,
+    schedule_timestamp: str,
+    webhook_url: str,
+    payload: Dict[str, Any],
+    version: str,
+):
+    """
+    Agenda uma mensagem. A versão capturada aqui é a que o fire_webhook vai
+    usar como expected_version no CAS. Se algum POST substituir a mensagem
+    no meio do caminho, o disparo detecta a versão nova e aborta.
+    """
     with schedule_lock:
         if message_id in scheduled_jobs:
             schedule.clear(message_id)
@@ -367,8 +498,7 @@ def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str,
 
         if schedule_time_utc <= now:
             # Política absoluta: mensagem no passado nunca dispara. Vai para DLQ
-            # com reason "missed_window". Quem quer "disparar agora" precisa usar
-            # um scheduleTo ligeiramente no futuro. O POST /messages já rejeita
+            # com reason "missed_window". O POST /messages já rejeita
             # explicitamente no passado; este ramo cobre chamadas internas
             # (restore/sweep) que ainda caem aqui.
             log(f"Message {message_id} scheduleTo in the past ({schedule_timestamp}); moving to DLQ")
@@ -377,13 +507,15 @@ def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str,
 
         # A lib `schedule` usa datetime.now() local naive para run_pending().
         # Convertemos para local naive APENAS aqui para preencher next_run.
-        # Requer TZ=UTC no container (recomendado).
+        # Requer TZ=UTC no container (fixado no Dockerfile).
         local_dt = schedule_time_utc.astimezone().replace(tzinfo=None)
+
+        captured_version = version
 
         def job():
             t = threading.Thread(
                 target=fire_webhook,
-                args=(message_id, webhook_url, payload),
+                args=(message_id, webhook_url, payload, captured_version),
                 daemon=True
             )
             t.start()
@@ -393,7 +525,7 @@ def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str,
         job_instance.next_run = local_dt
 
         scheduled_jobs[message_id] = job_instance
-        log(f"Message {message_id} scheduled for {schedule_time_utc.isoformat()} UTC")
+        log(f"Message {message_id} scheduled for {schedule_time_utc.isoformat()} UTC (v={version[:8]})")
 
 
 def scheduler_worker():
@@ -422,8 +554,18 @@ def sweep_failed_messages():
                     data = json.loads(raw)
                     msg_id = data.get("id")
                     schedule_to = data.get("scheduleTo")
+                    current_version = data.get("_version")
 
                     if not msg_id or not schedule_to:
+                        continue
+
+                    # Sem _version? Mensagem legacy que o restore ainda não
+                    # migrou; pular e deixar para o próximo sweep.
+                    if not current_version:
+                        continue
+
+                    # Nunca tocar em mensagens em disparo ativo.
+                    if data.get("status") == MessageStatus.PROCESSING:
                         continue
 
                     schedule_time_utc = parse_iso_to_utc(schedule_to)
@@ -433,7 +575,7 @@ def sweep_failed_messages():
                         with schedule_lock:
                             if msg_id not in scheduled_jobs:
                                 log(f"[SWEEP] Re-scheduling future message {msg_id} (scheduleTo: {schedule_to})")
-                                schedule_message(msg_id, schedule_to, data["webhookUrl"], data["payload"])
+                                schedule_message(msg_id, schedule_to, data["webhookUrl"], data["payload"], current_version)
                         continue
 
                     # ========================================================
@@ -494,11 +636,11 @@ def sweep_failed_messages():
                             except Exception:
                                 pass
 
-                        log(f"[SWEEP] Retrying overdue message {msg_id} (failCount: {fail_count})")
+                        log(f"[SWEEP] Retrying overdue message {msg_id} (failCount: {fail_count}, v={current_version[:8]})")
                         swept += 1
                         t = threading.Thread(
                             target=fire_webhook,
-                            args=(msg_id, data["webhookUrl"], data["payload"]),
+                            args=(msg_id, data["webhookUrl"], data["payload"], current_version),
                             daemon=True
                         )
                         t.start()
@@ -516,6 +658,7 @@ def sweep_failed_messages():
 def restore_scheduled_messages():
     try:
         restored_count = 0
+        migrated_count = 0
         dlq_count = 0
         deferred_to_sweep = 0
         now = now_utc()
@@ -540,9 +683,25 @@ def restore_scheduled_messages():
                     dlq_count += 1
                     continue
 
+                # Migração inline: mensagens pré-PR 3 não têm _version nem status.
+                # Atribuímos no primeiro read e reescrevemos (blind set — restore
+                # é single-thread, antes dos workers começarem a mexer em chaves).
+                if not data.get("_version"):
+                    data["_version"] = _new_version()
+                    data["status"] = data.get("status") or MessageStatus.SCHEDULED
+                    try:
+                        redis_client.set(key, json.dumps(data))
+                        migrated_count += 1
+                        log(f"[STARTUP] migrated legacy message {msg_id} (v={data['_version'][:8]})")
+                    except Exception as e:
+                        log(f"[STARTUP] {msg_id} failed migration, skipping: {e}")
+                        continue
+
+                version = data["_version"]
+
                 if schedule_time_utc <= now:
-                    # Mensagem no passado. Política absoluta:
-                    # - Sem _firstAttemptAt → missed_window → DLQ (nunca dispara)
+                    # Política absoluta:
+                    # - Sem _firstAttemptAt → missed_window → DLQ
                     # - Com _firstAttemptAt → retry legítimo → delegar ao sweep
                     first_attempt = data.get("_firstAttemptAt")
                     if not first_attempt:
@@ -550,21 +709,20 @@ def restore_scheduled_messages():
                         _move_to_dlq(msg_id, "missed_window_on_startup")
                         dlq_count += 1
                         continue
-                    log(f"[STARTUP] {msg_id} overdue but has _firstAttemptAt; deferring to sweep")
+                    log(f"[STARTUP] {msg_id} overdue with _firstAttemptAt; deferring to sweep")
                     deferred_to_sweep += 1
                     continue
 
                 # Futuro: reagendar normalmente.
-                schedule_message(msg_id, schedule_to, data["webhookUrl"], data["payload"])
+                schedule_message(msg_id, schedule_to, data["webhookUrl"], data["payload"], version)
                 restored_count += 1
                 log(f"Restored scheduled message - ID: {msg_id}")
             except Exception as e:
                 log(f"Failed to restore message {key}: {e}")
 
         log(
-            f"Restore summary: restored={restored_count} dlq={dlq_count} "
-            f"deferred_to_sweep={deferred_to_sweep} "
-            f"(SKIP_OVERDUE_ON_STARTUP={SKIP_OVERDUE_ON_STARTUP}, ignored — absolute policy now)"
+            f"Restore summary: restored={restored_count} migrated={migrated_count} "
+            f"dlq={dlq_count} deferred_to_sweep={deferred_to_sweep}"
         )
     except Exception as e:
         log(f"Error restoring messages: {e}")
@@ -619,19 +777,23 @@ async def create_scheduled_message(message: ScheduleMessage, token: str = Depend
         else:
             log(f"Creating new message - ID: {message.id}")
 
+        version = _new_version()
         message_data = {
             "id": message.id,
             "scheduleTo": message.scheduleTo,
             "payload": message.payload,
-            "webhookUrl": message.webhookUrl
+            "webhookUrl": message.webhookUrl,
+            "_version": version,
+            "status": MessageStatus.SCHEDULED,
+            "_createdAt": now_utc().isoformat(),
         }
 
         redis_client.set(redis_key, json.dumps(message_data))
-        log(f"Message stored in Redis - ID: {message.id}")
+        log(f"Message stored in Redis - ID: {message.id} (v={version[:8]})")
 
-        schedule_message(message.id, message.scheduleTo, message.webhookUrl, message.payload)
+        schedule_message(message.id, message.scheduleTo, message.webhookUrl, message.payload, version)
 
-        return {"status": "scheduled", "messageId": message.id}
+        return {"status": "scheduled", "messageId": message.id, "version": version}
 
     except HTTPException:
         raise
@@ -787,7 +949,7 @@ async def health_check():
         "redis": "unknown",
         "n8nInternal": "not_configured",
         "n8nExternal": "unknown",
-        "version": "2.2.0",
+        "version": "2.3.0",
     }
 
     try:
@@ -830,13 +992,22 @@ async def stats(token: str = Depends(verify_token)):
         total_redis = 0
         failed_count = 0
         overdue_count = 0
+        legacy_count = 0
+        by_status: Dict[str, int] = {}
         now = now_utc()
 
         for key in redis_client.scan_iter(match="message:*", count=1000):
             total_redis += 1
             raw = redis_client.get(key)
             if raw:
-                data = json.loads(raw)
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    continue
+                if not data.get("_version"):
+                    legacy_count += 1
+                status_val = data.get("status") or "unknown"
+                by_status[status_val] = by_status.get(status_val, 0) + 1
                 if data.get("_failCount"):
                     failed_count += 1
                 schedule_to = data.get("scheduleTo")
@@ -858,6 +1029,8 @@ async def stats(token: str = Depends(verify_token)):
             "failedMessages": failed_count,
             "overdueMessages": overdue_count,
             "deadLetterMessages": dead_count,
+            "legacyMessages": legacy_count,
+            "byStatus": by_status,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -949,5 +1122,5 @@ async def list_dead_versions(message_id: str, token: str = Depends(verify_token)
 
 
 if __name__ == "__main__":
-    log("Starting Scheduler API server v2.2.0")
+    log("Starting Scheduler API server v2.3.0")
     uvicorn.run(app, host="0.0.0.0", port=8000)
