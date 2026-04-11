@@ -23,6 +23,7 @@ def parse_iso_to_utc(value: str) -> datetime:
     return dt.astimezone(UTC)
 
 import redis
+import redis.exceptions as redis_exceptions
 import requests
 import schedule
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, Body
@@ -32,7 +33,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Scheduler API", version="2.1.0")
+app = FastAPI(title="Scheduler API", version="2.2.0")
 
 API_TOKEN = os.getenv('API_TOKEN')
 
@@ -65,6 +66,17 @@ MESSAGE_MAX_AGE_HOURS = float(os.getenv('MESSAGE_MAX_AGE_HOURS', '24'))
 # Tolerância (segundos) para aceitar scheduleTo levemente no passado sem
 # rejeitar com 400. Acima disso, POST /messages retorna 400.
 PAST_SCHEDULE_TOLERANCE_SECONDS = int(os.getenv('PAST_SCHEDULE_TOLERANCE_SECONDS', '30'))
+
+# Dead Letter Queue: mensagens mortas (DLQ) ficam em chaves dead:message:{id}:{version}
+# com TTL em dias. Índice secundário dead:index:{id} tem todas as versões mortas.
+DLQ_TTL_DAYS = int(os.getenv('DLQ_TTL_DAYS', '30'))
+
+# Quantas falhas de webhook até a mensagem virar DLQ em vez de continuar sendo retentada.
+MAX_FAIL_COUNT = int(os.getenv('MAX_FAIL_COUNT', '10'))
+
+# Janela máxima que uma mensagem pode ficar em retry depois do primeiro disparo
+# (_firstAttemptAt). Acima disso, vira DLQ com reason "retry_deadline".
+RETRY_DEADLINE_HOURS = float(os.getenv('RETRY_DEADLINE_HOURS', '6'))
 
 # Máximo de webhooks disparando em paralelo (evita travar o servidor)
 WEBHOOK_MAX_CONCURRENT = int(os.getenv('WEBHOOK_MAX_CONCURRENT', 5))
@@ -122,6 +134,75 @@ class BulkDeleteFilters(BaseModel):
 
 scheduled_jobs: Dict[str, schedule.Job] = {}
 schedule_lock = threading.RLock()
+
+
+def _move_to_dlq(
+    message_id: str,
+    reason: str,
+    extra: Optional[Dict[str, Any]] = None,
+    expected_version: Optional[str] = None,
+) -> bool:
+    """
+    Move uma mensagem para a DLQ usando WATCH + MULTI/EXEC no Redis.
+
+    - Chave destino: dead:message:{id}:{version}. A versão vem de _version se
+      já existir; caso contrário, usa "v0" (mensagens antigas pré-versionamento).
+    - Índice dead:index:{id} (Set) guarda todas as versões mortas daquele id,
+      útil para histórico de auditoria.
+    - Se expected_version for passado, só move se a versão atual bate (CAS).
+      Na Fase 1 os callers passam None (ainda não há versionamento).
+    - Nunca dispara mensagem antiga: esta é a saída "limpa" para mensagens
+      perdidas (missed_window, retry_deadline, max_retries, too_old).
+    - Aplica TTL de DLQ_TTL_DAYS na chave e no índice para evitar crescimento
+      infinito.
+    """
+    src = f"message:{message_id}"
+    for _attempt in range(3):
+        try:
+            with redis_client.pipeline() as pipe:
+                pipe.watch(src)
+                raw = pipe.get(src)
+                if not raw:
+                    pipe.unwatch()
+                    return False
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    pipe.unwatch()
+                    return False
+
+                current_version = data.get("_version")
+                if expected_version is not None and current_version != expected_version:
+                    pipe.unwatch()
+                    return False
+
+                version_for_key = current_version or "v0"
+                dst = f"dead:message:{message_id}:{version_for_key}"
+                index_key = f"dead:index:{message_id}"
+
+                data["_deadReason"] = reason
+                data["_deadAt"] = now_utc().isoformat()
+                data["status"] = "dead_letter"
+                if extra:
+                    data.update(extra)
+
+                ttl_seconds = DLQ_TTL_DAYS * 86400
+                pipe.multi()
+                pipe.set(dst, json.dumps(data), ex=ttl_seconds)
+                pipe.sadd(index_key, version_for_key)
+                pipe.expire(index_key, ttl_seconds)
+                pipe.delete(src)
+                pipe.execute()
+
+                log(f"[DLQ] {message_id}@{version_for_key} -> dead-letter (reason={reason})")
+                return True
+        except redis_exceptions.WatchError:
+            continue
+        except Exception as e:
+            log(f"[DLQ] Failed to move {message_id}: {e}")
+            return False
+    log(f"[DLQ] Gave up moving {message_id} after WATCH retries")
+    return False
 
 
 def _rewrite_webhook_url(url: str) -> str:
@@ -198,6 +279,19 @@ def _fire_webhook_inner(message_id: str, webhook_url: str, payload: Dict[str, An
     if internal_url_preview != webhook_url:
         log(f"URL rewrite enabled for {message_id}: {webhook_url} -> {internal_url_preview} (with fallback)")
 
+    # Marca _firstAttemptAt (blind write — Fase 1). Este carimbo é o que
+    # autoriza retries futuros pelo sweep. Sem ele, a mensagem é "missed_window"
+    # e nunca será disparada. Na Fase 2, esta escrita migra para CAS.
+    try:
+        raw = redis_client.get(f"message:{message_id}")
+        if raw:
+            data = json.loads(raw)
+            if not data.get("_firstAttemptAt"):
+                data["_firstAttemptAt"] = now_utc().isoformat()
+                redis_client.set(f"message:{message_id}", json.dumps(data))
+    except Exception as e:
+        log(f"[{message_id}] Failed to mark _firstAttemptAt: {e}")
+
     last_error = None
     for attempt in range(1, WEBHOOK_MAX_RETRIES + 1):
         try:
@@ -272,21 +366,13 @@ def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str,
         now = now_utc()
 
         if schedule_time_utc <= now:
-            age_seconds = (now - schedule_time_utc).total_seconds()
-            if MESSAGE_MAX_AGE_HOURS > 0 and age_seconds > MESSAGE_MAX_AGE_HOURS * 3600:
-                log(f"Message {message_id} is too old ({age_seconds/3600:.2f}h > {MESSAGE_MAX_AGE_HOURS}h limit), discarding")
-                try:
-                    redis_client.delete(f"message:{message_id}")
-                except Exception:
-                    pass
-                return
-            log(f"Message {message_id} is in the past ({schedule_timestamp}), firing immediately")
-            t = threading.Thread(
-                target=fire_webhook,
-                args=(message_id, webhook_url, payload),
-                daemon=True
-            )
-            t.start()
+            # Política absoluta: mensagem no passado nunca dispara. Vai para DLQ
+            # com reason "missed_window". Quem quer "disparar agora" precisa usar
+            # um scheduleTo ligeiramente no futuro. O POST /messages já rejeita
+            # explicitamente no passado; este ramo cobre chamadas internas
+            # (restore/sweep) que ainda caem aqui.
+            log(f"Message {message_id} scheduleTo in the past ({schedule_timestamp}); moving to DLQ")
+            _move_to_dlq(message_id, "missed_window")
             return
 
         # A lib `schedule` usa datetime.now() local naive para run_pending().
@@ -343,18 +429,56 @@ def sweep_failed_messages():
                     schedule_time_utc = parse_iso_to_utc(schedule_to)
 
                     if schedule_time_utc > now:
+                        # Futuro: garantir que está agendado em memória.
                         with schedule_lock:
                             if msg_id not in scheduled_jobs:
                                 log(f"[SWEEP] Re-scheduling future message {msg_id} (scheduleTo: {schedule_to})")
                                 schedule_message(msg_id, schedule_to, data["webhookUrl"], data["payload"])
                         continue
 
+                    # ========================================================
+                    # Mensagem no passado. Política absoluta:
+                    # - Sem _firstAttemptAt → nunca disparou → missed_window → DLQ
+                    # - Com _firstAttemptAt  → retry legítimo, sujeito a limites
+                    # ========================================================
+                    first_attempt = data.get("_firstAttemptAt")
+                    if not first_attempt:
+                        log(f"[SWEEP] {msg_id} overdue without _firstAttemptAt; moving to DLQ (missed_window)")
+                        _move_to_dlq(msg_id, "missed_window_sweep")
+                        continue
+
+                    # Retry deadline: muito tempo tentando desde o primeiro disparo.
+                    try:
+                        first_dt = parse_iso_to_utc(first_attempt)
+                        if (now - first_dt).total_seconds() > RETRY_DEADLINE_HOURS * 3600:
+                            log(f"[SWEEP] {msg_id} exceeded RETRY_DEADLINE_HOURS; moving to DLQ")
+                            _move_to_dlq(
+                                msg_id,
+                                "retry_deadline",
+                                {"_failCount": data.get("_failCount", 0)},
+                            )
+                            continue
+                    except Exception:
+                        pass
+
+                    # Idade absoluta da mensagem.
                     if _is_too_old(schedule_to):
-                        log(f"[SWEEP] Message {msg_id} is too old, removing from Redis")
-                        try:
-                            redis_client.delete(key)
-                        except Exception:
-                            pass
+                        log(f"[SWEEP] {msg_id} older than MESSAGE_MAX_AGE_HOURS; moving to DLQ")
+                        _move_to_dlq(
+                            msg_id,
+                            "too_old",
+                            {"_ageLimitHours": MESSAGE_MAX_AGE_HOURS},
+                        )
+                        continue
+
+                    fail_count = data.get("_failCount", 0)
+                    if fail_count >= MAX_FAIL_COUNT:
+                        log(f"[SWEEP] {msg_id} hit MAX_FAIL_COUNT={MAX_FAIL_COUNT}; moving to DLQ")
+                        _move_to_dlq(
+                            msg_id,
+                            "max_retries",
+                            {"_failCount": fail_count},
+                        )
                         continue
 
                     with schedule_lock:
@@ -370,11 +494,7 @@ def sweep_failed_messages():
                             except Exception:
                                 pass
 
-                        fail_count = data.get("_failCount", 0)
-                        if fail_count >= 10:
-                            continue
-
-                        log(f"[SWEEP] Firing overdue message {msg_id} (scheduleTo: {schedule_to}, failCount: {fail_count})")
+                        log(f"[SWEEP] Retrying overdue message {msg_id} (failCount: {fail_count})")
                         swept += 1
                         t = threading.Thread(
                             target=fire_webhook,
@@ -396,7 +516,8 @@ def sweep_failed_messages():
 def restore_scheduled_messages():
     try:
         restored_count = 0
-        skipped_count = 0
+        dlq_count = 0
+        deferred_to_sweep = 0
         now = now_utc()
 
         for key in redis_client.scan_iter(match="message:*", count=1000):
@@ -405,30 +526,46 @@ def restore_scheduled_messages():
                 if not raw:
                     continue
                 data = json.loads(raw)
+                msg_id = data.get("id")
+                schedule_to = data.get("scheduleTo", "")
 
-                if _is_too_old(data.get("scheduleTo", "")):
-                    log(f"[STARTUP] Message {data.get('id')} is too old, removing from Redis")
-                    redis_client.delete(key)
-                    skipped_count += 1
+                if not msg_id or not schedule_to:
                     continue
 
-                if SKIP_OVERDUE_ON_STARTUP:
-                    try:
-                        schedule_time_utc = parse_iso_to_utc(data.get("scheduleTo", ""))
-                        if schedule_time_utc <= now:
-                            log(f"[STARTUP] Bypassing overdue message {data['id']} (kept in Redis)")
-                            skipped_count += 1
-                            continue  # não agenda, não deleta
-                    except Exception:
-                        pass
+                try:
+                    schedule_time_utc = parse_iso_to_utc(schedule_to)
+                except Exception:
+                    log(f"[STARTUP] {msg_id} has invalid scheduleTo; moving to DLQ")
+                    _move_to_dlq(msg_id, "invalid_scheduleTo_on_startup")
+                    dlq_count += 1
+                    continue
 
-                schedule_message(data["id"], data["scheduleTo"], data["webhookUrl"], data["payload"])
+                if schedule_time_utc <= now:
+                    # Mensagem no passado. Política absoluta:
+                    # - Sem _firstAttemptAt → missed_window → DLQ (nunca dispara)
+                    # - Com _firstAttemptAt → retry legítimo → delegar ao sweep
+                    first_attempt = data.get("_firstAttemptAt")
+                    if not first_attempt:
+                        log(f"[STARTUP] {msg_id} overdue without _firstAttemptAt; moving to DLQ")
+                        _move_to_dlq(msg_id, "missed_window_on_startup")
+                        dlq_count += 1
+                        continue
+                    log(f"[STARTUP] {msg_id} overdue but has _firstAttemptAt; deferring to sweep")
+                    deferred_to_sweep += 1
+                    continue
+
+                # Futuro: reagendar normalmente.
+                schedule_message(msg_id, schedule_to, data["webhookUrl"], data["payload"])
                 restored_count += 1
-                log(f"Restored scheduled message - ID: {data['id']}")
+                log(f"Restored scheduled message - ID: {msg_id}")
             except Exception as e:
                 log(f"Failed to restore message {key}: {e}")
 
-        log(f"Restored {restored_count} scheduled messages | Bypassed {skipped_count} overdue (still in Redis)")
+        log(
+            f"Restore summary: restored={restored_count} dlq={dlq_count} "
+            f"deferred_to_sweep={deferred_to_sweep} "
+            f"(SKIP_OVERDUE_ON_STARTUP={SKIP_OVERDUE_ON_STARTUP}, ignored — absolute policy now)"
+        )
     except Exception as e:
         log(f"Error restoring messages: {e}")
 
@@ -650,7 +787,7 @@ async def health_check():
         "redis": "unknown",
         "n8nInternal": "not_configured",
         "n8nExternal": "unknown",
-        "version": "2.1.0",
+        "version": "2.2.0",
     }
 
     try:
@@ -713,16 +850,104 @@ async def stats(token: str = Depends(verify_token)):
         with schedule_lock:
             job_count = len(schedule.jobs)
 
+        dead_count = sum(1 for _ in redis_client.scan_iter(match="dead:message:*", count=1000))
+
         return {
             "messagesInRedis": total_redis,
             "jobsInMemory": job_count,
             "failedMessages": failed_count,
             "overdueMessages": overdue_count,
+            "deadLetterMessages": dead_count,
         }
     except Exception as e:
         return {"error": str(e)}
 
 
+@app.get("/dead")
+async def list_dead_letter(
+    limit: int = Query(default=100, ge=1, le=1000),
+    token: str = Depends(verify_token),
+):
+    """
+    Lista mensagens mortas (DLQ). Cada entrada é uma versão morta específica,
+    identificada por {id, version}. A mesma mensagem pode aparecer múltiplas
+    vezes se morreu mais de uma vez (p.ex. ID reutilizado).
+    """
+    try:
+        items = []
+        scanned = 0
+        for key in redis_client.scan_iter(match="dead:message:*", count=1000):
+            scanned += 1
+            raw = redis_client.get(key)
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            try:
+                _, _, rest = key.split(":", 2)
+                if ":" in rest:
+                    msg_id, version = rest.rsplit(":", 1)
+                else:
+                    msg_id, version = rest, "v0"
+            except Exception:
+                msg_id, version = data.get("id", "unknown"), "v0"
+            items.append({
+                "id": msg_id,
+                "version": version,
+                "deadReason": data.get("_deadReason"),
+                "deadAt": data.get("_deadAt"),
+                "scheduleTo": data.get("scheduleTo"),
+                "failCount": data.get("_failCount"),
+                "lastError": data.get("_lastError"),
+                "webhookUrl": data.get("webhookUrl"),
+                "payload": data.get("payload"),
+            })
+            if len(items) >= limit:
+                break
+
+        items.sort(key=lambda it: it.get("deadAt") or "", reverse=True)
+        return {"count": len(items), "truncated": len(items) >= limit, "items": items}
+    except Exception as e:
+        log(f"Error in list_dead_letter: {type(e).__name__}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to list DLQ: {str(e)}")
+
+
+@app.get("/dead/{message_id}/versions")
+async def list_dead_versions(message_id: str, token: str = Depends(verify_token)):
+    """Lista todas as versões mortas de um mesmo id (via dead:index:{id})."""
+    try:
+        versions = redis_client.smembers(f"dead:index:{message_id}") or set()
+        out = []
+        stale = []
+        for v in versions:
+            raw = redis_client.get(f"dead:message:{message_id}:{v}")
+            if not raw:
+                stale.append(v)
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            out.append({
+                "version": v,
+                "deadReason": data.get("_deadReason"),
+                "deadAt": data.get("_deadAt"),
+                "failCount": data.get("_failCount"),
+            })
+        if stale:
+            try:
+                redis_client.srem(f"dead:index:{message_id}", *stale)
+            except Exception:
+                pass
+        out.sort(key=lambda it: it.get("deadAt") or "", reverse=True)
+        return {"id": message_id, "count": len(out), "versions": out}
+    except Exception as e:
+        log(f"Error in list_dead_versions: {type(e).__name__}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to list versions: {str(e)}")
+
+
 if __name__ == "__main__":
-    log("Starting Scheduler API server v2.0.0")
+    log("Starting Scheduler API server v2.2.0")
     uvicorn.run(app, host="0.0.0.0", port=8000)
